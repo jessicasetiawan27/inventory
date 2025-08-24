@@ -1,0 +1,6 @@
+streamlit>=1.32
+pandas
+supabase
+altair
+xlsxwriter
+openpyxl

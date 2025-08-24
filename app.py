@@ -392,66 +392,157 @@ def render_tambah_master():
 # ================== REQUEST USER (IN/OUT/RETURN) ==================
 def render_request_in():
     st.markdown("## Request Barang IN (Masuk)")
-    if df_inv.empty:
-        st.info("Belum ada master barang.")
-        return
-    items = df_inv.to_dict(orient="records")
-    c1, c2 = st.columns(2)
-    idx = c1.selectbox("Pilih Barang", range(len(items)),
-                       format_func=lambda i: f"{items[i]['item']} ({items[i]['qty']} {items[i]['unit']})")
-    qty = c2.number_input("Qty Masuk", min_value=1, step=1)
-    do_number = st.text_input("Nomor Surat Jalan (wajib)")
-    file_pdf = st.file_uploader("Upload PDF Surat Jalan (wajib)", type=["pdf"])
 
-    if st.button("Ajukan Request IN"):
-        if not do_number.strip():
-            st.error("Nomor Surat Jalan wajib diisi."); return
-        if not file_pdf:
-            st.error("PDF Surat Jalan wajib diupload."); return
-        # simpan file (ephemeral)
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        path = os.path.join(UPLOADS_DIR, f"DO_{st.session_state.auth['username']}_{ts}.pdf")
-        with open(path, "wb") as f:
-            f.write(file_pdf.getbuffer())
-        rec = {
-            "type": "IN",
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "code": items[idx]["code"], "item": items[idx]["item"], "qty": int(qty),
-            "unit": items[idx]["unit"], "trans_type": None, "event": "-",
-            "do_number": do_number.strip(), "attachment": path,
-            "user": st.session_state.auth["username"], "timestamp": ts_text()
-        }
-        pending_add(rec)
-        st.success("Request IN diajukan, menunggu persetujuan.")
-        st.experimental_rerun()
+    mode = st.radio("Cara input item", ["Pilih dari master", "Input manual"], horizontal=True)
+
+    if mode == "Pilih dari master":
+        df = load_inventory_df()
+        if df.empty:
+            st.info("Belum ada master barang.")
+            return
+        items = df.to_dict(orient="records")
+        c1, c2 = st.columns(2)
+        idx = c1.selectbox(
+            "Pilih Barang",
+            range(len(items)),
+            format_func=lambda i: f"{items[i]['item']} ({items[i]['qty']} {items[i]['unit']})"
+        )
+        qty = c2.number_input("Qty Masuk", min_value=1, step=1)
+        do_number = st.text_input("Nomor Surat Jalan (wajib)")
+        file_pdf = st.file_uploader("Upload PDF Surat Jalan (wajib)", type=["pdf"])
+
+        if st.button("Ajukan Request IN"):
+            if not do_number.strip():
+                st.error("Nomor Surat Jalan wajib diisi."); return
+            if not file_pdf:
+                st.error("PDF Surat Jalan wajib diupload."); return
+            # simpan file (ephemeral)
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            path = os.path.join(UPLOADS_DIR, f"DO_{st.session_state.auth['username']}_{ts}.pdf")
+            with open(path, "wb") as f:
+                f.write(file_pdf.getbuffer())
+
+            rec = {
+                "type": "IN",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "code": items[idx]["code"], "item": items[idx]["item"], "qty": int(qty),
+                "unit": items[idx]["unit"], "trans_type": None, "event": "-",
+                "do_number": do_number.strip(), "attachment": path,
+                "user": st.session_state.auth["username"], "timestamp": ts_text()
+            }
+            pending_add(rec)
+            st.success("Request IN diajukan, menunggu persetujuan.")
+            st.experimental_rerun()
+
+    else:  # Input manual
+        c1, c2 = st.columns(2)
+        code = c1.text_input("Kode Barang (baru/eksisting)", placeholder="ITM-0009")
+        name = c2.text_input("Nama Barang", placeholder="Nama produk")
+        c3, c4 = st.columns(2)
+        unit = c3.text_input("Satuan", placeholder="pcs/box/liter", value="-")
+        qty  = c4.number_input("Qty Masuk", min_value=1, step=1)
+        do_number = st.text_input("Nomor Surat Jalan (wajib)")
+        file_pdf  = st.file_uploader("Upload PDF Surat Jalan (wajib)", type=["pdf"])
+
+        if st.button("Ajukan Request IN (Manual)"):
+            if not code.strip() or not name.strip():
+                st.error("Kode & Nama wajib diisi."); return
+            if not do_number.strip():
+                st.error("Nomor Surat Jalan wajib diisi."); return
+            if not file_pdf:
+                st.error("PDF Surat Jalan wajib diupload."); return
+
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            path = os.path.join(UPLOADS_DIR, f"DO_{st.session_state.auth['username']}_{ts}.pdf")
+            with open(path, "wb") as f:
+                f.write(file_pdf.getbuffer())
+
+            rec = {
+                "type": "IN",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "code": code.strip(), "item": name.strip(), "qty": int(qty),
+                "unit": unit.strip() or "-", "trans_type": None, "event": "-",
+                "do_number": do_number.strip(), "attachment": path,
+                "user": st.session_state.auth["username"], "timestamp": ts_text()
+            }
+            pending_add(rec)
+            st.success("Request IN (manual) diajukan, menunggu persetujuan.")
+            st.experimental_rerun()
 
 def render_request_out():
     st.markdown("## Request Barang OUT (Keluar)")
-    if df_inv.empty:
-        st.info("Belum ada master barang.")
-        return
-    items = df_inv.to_dict(orient="records")
-    c1, c2 = st.columns(2)
-    idx = c1.selectbox("Pilih Barang", range(len(items)),
-                       format_func=lambda i: f"{items[i]['item']} (Stok: {items[i]['qty']} {items[i]['unit']})")
-    max_qty = int(items[idx]["qty"])
-    qty = c2.number_input("Qty Keluar", min_value=1, max_value=max_qty if max_qty>0 else 1, step=1)
+
+    mode = st.radio("Cara input item", ["Pilih dari master", "Input manual"], horizontal=True)
     tipe = st.selectbox("Tipe Transaksi", TRANS_TYPES, index=0)
     event = st.text_input("Nama Event (wajib)")
-    if st.button("Ajukan Request OUT"):
-        if not event.strip():
-            st.error("Event wajib diisi."); return
-        rec = {
-            "type": "OUT",
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "code": items[idx]["code"], "item": items[idx]["item"], "qty": int(qty),
-            "unit": items[idx]["unit"], "trans_type": tipe, "event": event.strip(),
-            "do_number": "-", "attachment": None,
-            "user": st.session_state.auth["username"], "timestamp": ts_text()
-        }
-        pending_add(rec)
-        st.success("Request OUT diajukan, menunggu persetujuan.")
-        st.experimental_rerun()
+
+    if mode == "Pilih dari master":
+        df = load_inventory_df()
+        if df.empty:
+            st.info("Belum ada master barang.")
+            return
+        items = df.to_dict(orient="records")
+        c1, c2 = st.columns(2)
+        idx = c1.selectbox(
+            "Pilih Barang",
+            range(len(items)),
+            format_func=lambda i: f"{items[i]['item']} (Stok: {items[i]['qty']} {items[i]['unit']})"
+        )
+        max_qty = int(items[idx]["qty"])
+        qty = c2.number_input(
+            "Qty Keluar",
+            min_value=1,
+            max_value=max_qty if max_qty > 0 else 1,
+            step=1
+        )
+
+        if st.button("Ajukan Request OUT"):
+            if not event.strip():
+                st.error("Event wajib diisi."); return
+            rec = {
+                "type": "OUT",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "code": items[idx]["code"], "item": items[idx]["item"], "qty": int(qty),
+                "unit": items[idx]["unit"], "trans_type": tipe, "event": event.strip(),
+                "do_number": "-", "attachment": None,
+                "user": st.session_state.auth["username"], "timestamp": ts_text()
+            }
+            pending_add(rec)
+            st.success("Request OUT diajukan, menunggu persetujuan.")
+            st.experimental_rerun()
+
+    else:  # Input manual
+        df = load_inventory_df()
+        c1, c2 = st.columns(2)
+        code = c1.text_input("Kode Barang (harus sudah terdaftar)", placeholder="ITM-0001")
+        qty  = c2.number_input("Qty Keluar", min_value=1, step=1)
+
+        if st.button("Ajukan Request OUT (Manual)"):
+            if not event.strip():
+                st.error("Event wajib diisi."); return
+            if not code.strip():
+                st.error("Kode barang wajib diisi."); return
+
+            # cek keberadaan & stok
+            if df.empty or code.strip() not in df["code"].tolist():
+                st.error("Kode belum terdaftar di master. Tambahkan di 'Tambah Master' atau gunakan IN (manual) dulu.")
+                return
+            row = df[df["code"] == code.strip()].iloc[0]
+            cur = int(row["qty"])
+            if int(qty) > cur:
+                st.error(f"Qty OUT melebihi stok tersedia ({cur})."); return
+
+            rec = {
+                "type": "OUT",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "code": code.strip(), "item": row["item"], "qty": int(qty),
+                "unit": row.get("unit","-"), "trans_type": tipe, "event": event.strip(),
+                "do_number": "-", "attachment": None,
+                "user": st.session_state.auth["username"], "timestamp": ts_text()
+            }
+            pending_add(rec)
+            st.success("Request OUT (manual) diajukan, menunggu persetujuan.")
+            st.experimental_rerun()
 
 def render_request_return():
     st.markdown("## Request Retur")
@@ -504,62 +595,66 @@ def render_approve():
             st.warning("Pilih minimal satu ID."); return
         # muat inventory terbaru
         inv = load_inventory_df()
-        inv_by_code = {r["code"]: r for _, r in inv.iterrows()}
-        approved = 0
-        for id_ in pick:
-            row = d[d["id"] == id_].iloc[0].to_dict()
-            code, qty, rtype = row["code"], int(row["qty"]), str(row["type"]).upper()
-            if code not in inv_by_code:
-                st.error(f"Code {code} tidak ditemukan di inventory."); continue
-            cur = int(inv_by_code[code]["qty"])
-            if rtype == "IN": new = cur + qty
-            elif rtype == "OUT":
-                if qty > cur:
-                    st.error(f"Qty OUT > stok untuk {code}. Lewati."); continue
-                new = cur - qty
-            elif rtype == "RETURN": new = cur + qty
-            else:
-                st.error(f"Tipe tidak dikenal: {rtype}"); continue
+inv_by_code = {r["code"]: r for _, r in inv.iterrows()}
+approved = 0
+for id_ in pick:
+    row = d[d["id"] == id_].iloc[0].to_dict()
+    code, qty, rtype = row["code"], int(row["qty"]), str(row["type"]).upper()
 
-            # update inventory
-            inv_update_qty(code, new)
-            # catat history
-            history_add({
-                "action": f"APPROVE_{rtype}",
-                "date": row.get("date"),
-                "code": code, "item": row.get("item"),
-                "qty": qty, "stock": new, "unit": row.get("unit"),
-                "trans_type": row.get("trans_type"),
-                "event": row.get("event"), "do_number": row.get("do_number"),
-                "attachment": row.get("attachment"), "user": row.get("user"),
-                "timestamp": ts_text()
-            })
-            # hapus pending
-            pending_delete(id_)
-            approved += 1
-        st.success(f"Berhasil approve {approved} request.")
-        st.experimental_rerun()
+    # Jika belum ada di master:
+    if code not in inv_by_code:
+        if rtype in ("IN", "RETURN"):
+            # buat master item baru dengan qty 0, kemudian diproses normal
+            inv_insert(
+                code=code,
+                item=row.get("item","-"),
+                qty=0,
+                unit=row.get("unit","-"),
+                category="Uncategorized"
+            )
+            # refresh mapping lokal
+            inv_by_code[code] = {"code": code, "item": row.get("item","-"), "unit": row.get("unit","-"), "qty": 0}
+        else:  # OUT but item not found
+            st.error(f"Code {code} tidak ditemukan di inventory. OUT tidak bisa diproses."); 
+            continue
 
-    if col2.button("Reject Selected"):
-        if not pick:
-            st.warning("Pilih minimal satu ID."); return
-        rejected = 0
-        for id_ in pick:
-            row = d[d["id"] == id_].iloc[0].to_dict()
-            history_add({
-                "action": f"REJECT_{str(row.get('type','-')).upper()}",
-                "date": row.get("date"),
-                "code": row.get("code"), "item": row.get("item"),
-                "qty": int(row.get("qty",0)), "stock": None, "unit": row.get("unit"),
-                "trans_type": row.get("trans_type"),
-                "event": row.get("event"), "do_number": row.get("do_number"),
-                "attachment": row.get("attachment"), "user": row.get("user"),
-                "timestamp": ts_text()
-            })
-            pending_delete(id_)
-            rejected += 1
-        st.success(f"Berhasil reject {rejected} request.")
-        st.experimental_rerun()
+    cur = int(inv_by_code[code]["qty"])
+    if rtype == "IN":
+        new = cur + qty
+    elif rtype == "OUT":
+        if qty > cur:
+            st.error(f"Qty OUT > stok untuk {code}. Lewati."); 
+            continue
+        new = cur - qty
+    elif rtype == "RETURN":
+        new = cur + qty
+    else:
+        st.error(f"Tipe tidak dikenal: {rtype}")
+        continue
+
+    # update inventory
+    inv_update_qty(code, new)
+
+    # catat history
+    history_add({
+        "action": f"APPROVE_{rtype}",
+        "date": row.get("date"),
+        "code": code, "item": row.get("item"),
+        "qty": qty, "stock": new, "unit": row.get("unit"),
+        "trans_type": row.get("trans_type"),
+        "event": row.get("event"), "do_number": row.get("do_number"),
+        "attachment": row.get("attachment"), "user": row.get("user"),
+        "timestamp": ts_text()
+    })
+
+    # hapus pending
+    pending_delete(id_)
+    # update cache & map stok lokal
+    inv_by_code[code]["qty"] = new
+    approved += 1
+
+st.success(f"Berhasil approve {approved} request.")
+st.experimental_rerun()
 
 # ================== RIWAYAT & EXPORT ==================
 def render_riwayat():

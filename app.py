@@ -1,10 +1,12 @@
-# app.py — Supabase Inventory (multi-brand) with:
-# - IN: manual + Upload Excel (langsung insert ke pending)
-# - OUT: manual + Upload Excel; event dropdown (pilih yang ada / ketik baru)
-# - Approve IN: auto-create item baru jika belum ada (tanpa history ADD_ITEM)
-# - Stock Card: urut by date->timestamp, saldo berjalan jelas
-# - Riwayat (User): status PENDING/APPROVED/REJECTED
-# Prasyarat: tabel per brand (inventory_*, pending_*, history_*), users_gulavit. Secrets: SUPABASE_URL, SUPABASE_KEY
+# app.py — Supabase Inventory (multi-brand) dengan staging multi-item:
+# - IN: manual + Excel → tambah ke daftar → Ajukan (DO & PDF diterapkan ke baris terpilih)
+# - OUT: manual + Excel → tambah ke daftar → Ajukan
+# - RETURN: manual + Excel → tambah ke daftar → Ajukan
+# - Approve IN auto-create item baru jika belum ada
+# - Stock Card running balance (urut date->timestamp)
+# - Riwayat: status PENDING/APPROVED/REJECTED
+# Prasyarat: tabel per brand (inventory_*, pending_*, history_*), users_gulavit
+# Secrets: SUPABASE_URL, SUPABASE_KEY  (opsional passwords.admin/user buat fallback)
 
 import os
 import base64
@@ -429,8 +431,11 @@ if "logged_in" not in st.session_state:
     st.session_state.role=""
     st.session_state.current_brand="gulavit"
 
-for k in ["req_in_items","req_out_items","req_ret_items"]:
-    if k not in st.session_state: st.session_state[k]=[]
+for k in ["req_in_items","req_out_items","req_ret_items",
+          "in_select_flags","out_select_flags","ret_select_flags"]:
+    if k not in st.session_state:
+        st.session_state[k]=[] if "flags" not in k else []
+
 if "notification" not in st.session_state: st.session_state.notification=None
 
 # -------------------- LOGIN --------------------
@@ -505,16 +510,13 @@ def page_admin_stock_card():
     if not item_names: st.info("Belum ada master barang."); return
     sel = st.selectbox("Pilih Barang", item_names)
     if not sel: return
-    # ambil transaksi APPROVE_* + ADD_ITEM (kalau ada), urut date->timestamp
     filtered=[h for h in hist if h.get("item")==sel and (str(h.get("action","")).startswith("APPROVE") or str(h.get("action","")).startswith("ADD"))]
     if not filtered: st.info("Belum ada transaksi disetujui untuk barang ini."); return
     df=pd.DataFrame(filtered)
-    # tanggal efektif = date (kalau ada) else timestamp
     df["date_eff"]=pd.to_datetime(df["date"], errors="coerce")
     df["ts"]=pd.to_datetime(df["timestamp"], errors="coerce")
     df["sort_key"]=df["date_eff"].fillna(df["ts"])
     df=df.sort_values(["sort_key","ts"]).reset_index(drop=True)
-
     rows=[]; saldo=0
     for _,h in df.iterrows():
         act=str(h.get("action","")).upper()
@@ -524,7 +526,7 @@ def page_admin_stock_card():
             t_in=qty; saldo+=qty; ket="Initial Stock"
         elif act=="APPROVE_IN":
             t_in=qty; saldo+=qty
-            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and do!="- " else "")
+            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and do!='- ' else "")
         elif act=="APPROVE_OUT":
             t_out=qty; saldo-=qty
             ket=f"Request OUT ({h.get('trans_type','-')}) by {h.get('user','-')} — Event: {h.get('event','-')}"
@@ -549,7 +551,6 @@ def page_admin_tambah_master():
             if not code.strip(): st.error("Kode wajib."); return
             if code in inv: st.error(f"Kode '{code}' sudah ada."); return
             if not name.strip(): st.error("Nama barang wajib."); return
-            # insert langsung + history ADD_ITEM
             inv_insert_raw(st.session_state.current_brand, {"code":code.strip(),"item":name.strip(),"qty":int(qty),
                                                             "unit":unit.strip() or "-","category":cat.strip() or "Uncategorized"})
             history_add(st.session_state.current_brand, {"action":"ADD_ITEM","item":name.strip(),"qty":int(qty),"stock":int(qty),
@@ -627,14 +628,12 @@ def page_admin_approve():
             qty=int(pd.to_numeric(req["qty"], errors="coerce") or 0)
             ttype=str(req["type"]).upper()
 
-            # find by item name
             found_code=None
             for code,it in inv_map.items():
                 if it.get("name")==req["item"]:
                     found_code=code; break
 
             if ttype=="IN" and found_code is None:
-                # auto-create item baru (qty awal 0)
                 code_candidate = str(req.get("code") or "").strip()
                 if (not code_candidate) or code_candidate=="-" or (code_candidate in inv_map):
                     code_candidate = f"NEW-{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -769,101 +768,89 @@ def page_admin_reset():
 def _existing_events_for_out(brand: str) -> list:
     data = load_brand_data(brand)
     events=set()
-    # dari history OUT approved
     for h in data.get("history", []):
         if str(h.get("action","")).upper()=="APPROVE_OUT":
             ev=str(h.get("event","-")).strip()
             if ev and ev!="-": events.add(ev)
-    # dari pending OUT
     for p in data.get("pending_requests", []):
         if str(p.get("type","")).upper()=="OUT":
             ev=str(p.get("event","-")).strip()
             if ev and ev!="-": events.add(ev)
     return sorted(events)
 
+def _ensure_flags(flag_key, target_len):
+    cur = st.session_state.get(flag_key, [])
+    if len(cur)!=target_len:
+        st.session_state[flag_key] = [False]*target_len
+
+def _render_staged_table(df, flag_key, editor_key):
+    _ensure_flags(flag_key, len(df))
+    df = df.copy()
+    df["Pilih"] = st.session_state[flag_key]
+    cfg = {"Pilih": st.column_config.CheckboxColumn("Pilih", default=False)}
+    for c in df.columns:
+        if c!="Pilih": cfg[c]=st.column_config.TextColumn(c, disabled=True)
+    edited = st.data_editor(df, key=editor_key, use_container_width=True, hide_index=True, column_config=cfg)
+    st.session_state[flag_key] = edited["Pilih"].fillna(False).tolist()
+    return [i for i,v in enumerate(st.session_state[flag_key]) if v]
+
 def page_user_dashboard(): render_dashboard_pro(DATA, st.session_state.current_brand.capitalize(), allow_download=True)
 
 def page_user_stock_card(): page_admin_stock_card()
 
+# ---------- IN: MULTI-ITEM (manual + excel) ----------
 def page_user_request_in():
-    st.markdown(f"## Request Barang IN - {st.session_state.current_brand.capitalize()}"); st.divider()
+    st.markdown(f"## Request Barang IN (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
-    tab1, tab2 = st.tabs(["Input Manual","Upload Excel"])
+    tab1, tab2 = st.tabs(["Tambah Manual","Tambah dari Excel"])
 
-    # ---------- IN Manual ----------
+    # Tambah Manual (ke staging)
     with tab1:
-        # pilih existing ATAU tambah baru
-        mode = st.radio("Pilih Sumber Item", ["Pilih dari Inventory", "Tambah Item Baru"])
-        if mode == "Pilih dari Inventory":
+        mode = st.radio("Sumber Item", ["Pilih dari Inventory", "Tambah Item Baru"])
+        if mode=="Pilih dari Inventory":
             if not items:
                 st.info("Inventory kosong. Gunakan 'Tambah Item Baru'.")
             else:
-                col1,col2=st.columns(2)
-                idx=col1.selectbox("Pilih Barang", range(len(items)),
-                                   format_func=lambda x: f"{items[x]['name']} (Stok: {items[x]['qty']} {items[x].get('unit','-')})")
-                qty=col2.number_input("Jumlah", min_value=1, step=1)
-                do_number=st.text_input("Nomor Surat Jalan (wajib)")
-                pdf=st.file_uploader("Upload PDF DO (wajib — 1 file untuk request ini)", type=["pdf"], key="in_pdf_manual_exist")
-                if st.button("Ajukan IN (Existing)"):
-                    if not do_number.strip(): st.error("Nomor DO wajib."); return
-                    if not pdf: st.error("PDF DO wajib."); return
-                    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-                    path=os.path.join(UPLOADS_DIR, f"{st.session_state.username}_{ts}.pdf")
-                    with open(path,"wb") as f: f.write(pdf.getbuffer())
+                c1,c2 = st.columns(2)
+                idx=c1.selectbox("Pilih Barang", range(len(items)),
+                                 format_func=lambda x: f"{items[x]['name']} (Stok: {items[x]['qty']} {items[x].get('unit','-')})")
+                qty=c2.number_input("Jumlah", min_value=1, step=1)
+                if st.button("Tambah ke Daftar IN (Existing)"):
                     brand=st.session_state.current_brand
                     inv_by_name={it["name"]:(code,it.get("unit","-")) for code,it in load_brand_data(brand)["inventory"].items()}
                     name=items[idx]["name"]; code,unit=inv_by_name.get(name, ("-", items[idx].get("unit","-")))
                     base={"date": datetime.now().strftime("%Y-%m-%d"), "code":code, "item":name, "qty":int(qty),
-                          "unit":unit, "event":"-", "trans_type":None, "do_number":do_number.strip(),
-                          "attachment":path, "user":st.session_state.username, "timestamp":ts_text()}
-                    rec=normalize_out_record(base); rec["type"]="IN"
-                    pending_add_many(brand, [rec])
-                    st.success("Request IN diajukan & menunggu approval.")
-                    st.rerun()
+                          "unit":unit, "event":"-", "trans_type":None, "do_number":"-", "attachment":None,
+                          "user": st.session_state.username, "timestamp": ts_text()}
+                    st.session_state.req_in_items.append(normalize_out_record(base))
+                    st.success("Ditambahkan ke daftar IN.")
         else:
-            # tambah item baru (nama + unit + optional code)
-            col1,col2=st.columns(2)
-            code_new = col1.text_input("Kode Barang (opsional, biarkan kosong untuk auto)")
-            name_new = col2.text_input("Nama Barang (wajib)")
+            c1,c2 = st.columns(2)
+            code_new = c1.text_input("Kode Barang (opsional)")
+            name_new = c2.text_input("Nama Barang (wajib)")
             unit_new = st.text_input("Satuan (mis: pcs/box/liter)", value="pcs")
             qty=st.number_input("Jumlah", min_value=1, step=1, key="in_new_qty")
-            do_number=st.text_input("Nomor Surat Jalan (wajib)", key="in_new_do")
-            pdf=st.file_uploader("Upload PDF DO (wajib)", type=["pdf"], key="in_pdf_manual_new")
-            if st.button("Ajukan IN (Item Baru)"):
+            if st.button("Tambah ke Daftar IN (Item Baru)"):
                 if not name_new.strip(): st.error("Nama wajib."); return
-                if not do_number.strip(): st.error("Nomor DO wajib."); return
-                if not pdf: st.error("PDF DO wajib."); return
-                ts = datetime.now().strftime("%Y%m%d%H%M%S")
-                path=os.path.join(UPLOADS_DIR, f"{st.session_state.username}_{ts}.pdf")
-                with open(path,"wb") as f: f.write(pdf.getbuffer())
-                brand=st.session_state.current_brand
                 base={"date": datetime.now().strftime("%Y-%m-%d"),
                       "code": (code_new.strip() if code_new.strip() else "-"),
                       "item": name_new.strip(), "qty": int(qty),
-                      "unit": unit_new.strip() or "-", "event":"-","trans_type":None,
-                      "do_number": do_number.strip(), "attachment": path,
+                      "unit": unit_new.strip() or "-", "event":"-", "trans_type":None,
+                      "do_number":"-", "attachment":None,
                       "user": st.session_state.username, "timestamp": ts_text()}
-                rec=normalize_out_record(base); rec["type"]="IN"
-                pending_add_many(brand, [rec])
-                st.success("Request IN item baru diajukan & menunggu approval.")
-                st.rerun()
+                st.session_state.req_in_items.append(normalize_out_record(base))
+                st.success("Ditambahkan ke daftar IN.")
 
-    # ---------- IN Upload Excel (langsung insert pending) ----------
+    # Tambah dari Excel (ke staging)
     with tab2:
-        st.info("Format Excel: **Tanggal | Kode Barang | Nama Barang | Qty | Unit (opsional) | Event (opsional)**\n\n"
-                "Catatan: DO Number & PDF DO di bawah akan dipakai untuk SEMUA baris di Excel.")
+        st.info("Format Excel: **Tanggal | Kode Barang | Nama Barang | Qty | Unit (opsional) | Event (opsional)**")
         inv_records=[{"code":c,"name":it.get("name","-")} for c,it in DATA["inventory"].items()]
         st.download_button("📥 Unduh Template Excel IN",
                            data=make_in_template_bytes(inv_records),
                            file_name=f"Template_IN_{st.session_state.current_brand.capitalize()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         fu=st.file_uploader("Upload File Excel IN", type=["xlsx"], key="in_excel_uploader")
-        col1,col2=st.columns(2)
-        do_number=col1.text_input("Nomor Surat Jalan (wajib)", key="in_excel_do")
-        pdf=col2.file_uploader("Upload PDF DO (wajib)", type=["pdf"], key="in_excel_pdf")
-        if fu and st.button("Proses Excel → Ajukan IN"):
-            if not do_number.strip(): st.error("Nomor DO wajib."); return
-            if not pdf: st.error("PDF DO wajib."); return
+        if fu and st.button("Tambah dari Excel → Daftar IN"):
             try:
                 df_new=pd.read_excel(fu, engine="openpyxl")
             except Exception as e:
@@ -871,16 +858,11 @@ def page_user_request_in():
             req_cols=["Tanggal","Kode Barang","Nama Barang","Qty"]
             miss=[c for c in req_cols if c not in df_new.columns]
             if miss: st.error(f"Kolom berikut wajib: {', '.join(req_cols)}"); return
-            ts = datetime.now().strftime("%Y%m%d%H%M%S")
-            path=os.path.join(UPLOADS_DIR, f"{st.session_state.username}_{ts}.pdf")
-            with open(path,"wb") as f: f.write(pdf.getbuffer())
-
             brand=st.session_state.current_brand
             inv = load_brand_data(brand)["inventory"]
             by_code={code:(it.get("name"), it.get("unit","-")) for code,it in inv.items()}
             by_name={it.get("name"):(code, it.get("unit","-")) for code,it in inv.items()}
-
-            to_insert=[]; errors=[]; added=0
+            added, errors = 0, []
             for ridx,row in df_new.iterrows():
                 try:
                     dt=pd.to_datetime(row["Tanggal"], errors="coerce")
@@ -892,8 +874,6 @@ def page_user_request_in():
                     event_x=str(row["Event (opsional)"]).strip() if "Event (opsional)" in df_new.columns and pd.notna(row.get("Event (opsional)")) else "-"
                     if not name_x: errors.append(f"Baris {ridx+2}: Nama wajib."); continue
                     if qty_x<=0: errors.append(f"Baris {ridx+2}: Qty harus > 0."); continue
-
-                    # jika ada di inventory pakai unit existing
                     inv_name, inv_unit = (None, None); inv_code=None
                     if code_x and code_x in by_code:
                         inv_name, inv_unit = by_code[code_x]; inv_code=code_x
@@ -901,39 +881,89 @@ def page_user_request_in():
                     elif name_x and name_x in by_name:
                         inv_code, inv_unit = by_name[name_x]; inv_name = name_x
                         if not unit_x: unit_x = inv_unit
-
                     base={"date": date_str, "code": (inv_code if inv_code else (code_x if code_x else "-")),
                           "item": (inv_name if inv_name else name_x), "qty": qty_x, "unit": (unit_x if unit_x else "-"),
                           "event": (event_x if event_x else "-"), "trans_type": None,
-                          "do_number": do_number.strip(), "attachment": path,
+                          "do_number": "-", "attachment": None,
                           "user": st.session_state.username, "timestamp": ts_text()}
-                    rec=normalize_out_record(base); rec["type"]="IN"
-                    to_insert.append(rec); added+=1
+                    st.session_state.req_in_items.append(normalize_out_record(base))
+                    added+=1
                 except Exception as e:
                     errors.append(f"Baris {ridx+2}: {e}")
-            if to_insert: pending_add_many(brand, to_insert)
-            if added: st.success(f"{added} baris IN diajukan & menunggu approval.")
+            if added: st.success(f"{added} baris ditambahkan ke daftar IN.")
             if errors: st.warning("Beberapa baris dilewati:\n- " + "\n- ".join(errors))
-            st.rerun()
 
+    # DAFTAR & SUBMIT IN (multi)
+    if st.session_state.req_in_items:
+        st.divider()
+        st.subheader("Daftar Item Request IN (Staged)")
+        df_in = pd.DataFrame(st.session_state.req_in_items)
+        pref_cols=[c for c in ["date","code","item","qty","unit","event"] if c in df_in.columns]
+        df_in=df_in[pref_cols]
+        cA,cB = st.columns([1,1])
+        if cA.button("Pilih semua", key="in_sel_all"): st.session_state.in_select_flags=[True]*len(df_in)
+        if cB.button("Kosongkan pilihan", key="in_sel_none"): st.session_state.in_select_flags=[False]*len(df_in)
+        selected_idx = _render_staged_table(df_in, "in_select_flags", "editor_in_staged")
+
+        if st.button("Hapus Item Terpilih", key="delete_in"):
+            if selected_idx:
+                keep=[i for i in range(len(st.session_state.req_in_items)) if i not in selected_idx]
+                st.session_state.req_in_items = [st.session_state.req_in_items[i] for i in keep]
+                st.session_state.in_select_flags=[False]*len(st.session_state.req_in_items)
+                st.rerun()
+            else:
+                st.info("Tidak ada baris dipilih.")
+
+        st.markdown("#### Informasi Wajib untuk Ajukan (berlaku untuk baris terpilih)")
+        c1,c2 = st.columns(2)
+        do_number = c1.text_input("Nomor Surat Jalan (wajib)")
+        pdf = c2.file_uploader("Upload PDF DO (wajib, 1 file untuk semua baris terpilih)", type=["pdf"], key="in_pdf_submit")
+
+        if st.button("Ajukan Request IN Terpilih"):
+            if not selected_idx:
+                st.warning("Pilih setidaknya satu item."); return
+            if not do_number.strip():
+                st.error("Nomor DO wajib."); return
+            if not pdf:
+                st.error("PDF DO wajib."); return
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            path=os.path.join(UPLOADS_DIR, f"{st.session_state.username}_{ts}.pdf")
+            with open(path,"wb") as f: f.write(pdf.getbuffer())
+
+            to_insert=[]
+            for i,rec in enumerate(st.session_state.req_in_items):
+                if i in selected_idx:
+                    r=rec.copy()
+                    r["do_number"]=do_number.strip()
+                    r["attachment"]=path
+                    r["type"]="IN"
+                    to_insert.append(r)
+            if to_insert:
+                pending_add_many(st.session_state.current_brand, to_insert)
+                # Buang yang terkirim
+                keep=[i for i in range(len(st.session_state.req_in_items)) if i not in selected_idx]
+                st.session_state.req_in_items=[st.session_state.req_in_items[i] for i in keep]
+                st.session_state.in_select_flags=[False]*len(st.session_state.req_in_items)
+                st.success(f"{len(to_insert)} request IN diajukan & menunggu approval.")
+                st.rerun()
+
+# ---------- OUT: MULTI-ITEM ----------
 def page_user_request_out():
-    st.markdown(f"## Request Barang OUT - {st.session_state.current_brand.capitalize()}"); st.divider()
+    st.markdown(f"## Request Barang OUT (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
     if not items: st.info("Belum ada master barang."); return
-    tab1, tab2 = st.tabs(["Input Manual","Upload Excel"])
+    tab1, tab2 = st.tabs(["Tambah Manual","Tambah dari Excel"])
 
-    # ---------- OUT Manual (event dropdown / tambah baru) ----------
     with tab1:
-        col1,col2 = st.columns(2)
-        idx=col1.selectbox("Pilih Barang", range(len(items)),
-                           format_func=lambda x: f"{items[x]['name']} (Stok: {items[x]['qty']} {items[x].get('unit','-')})")
+        c1,c2 = st.columns(2)
+        idx=c1.selectbox("Pilih Barang", range(len(items)),
+                         format_func=lambda x: f"{items[x]['name']} (Stok: {items[x]['qty']} {items[x].get('unit','-')})")
         max_qty=int(pd.to_numeric(items[idx].get("qty",0), errors="coerce") or 0)
         if max_qty<1:
-            col2.number_input("Jumlah", min_value=0, max_value=0, step=1, value=0, disabled=True)
+            c2.number_input("Jumlah", min_value=0, max_value=0, step=1, value=0, disabled=True)
             st.warning("Stok item ini 0. Tidak bisa request OUT.")
         else:
-            qty=col2.number_input("Jumlah", min_value=1, max_value=max_qty, step=1)
-
+            qty=c2.number_input("Jumlah", min_value=1, max_value=max_qty, step=1)
         tipe=st.selectbox("Tipe Transaksi", TRANS_TYPES, index=0)
 
         existing_events = _existing_events_for_out(st.session_state.current_brand)
@@ -947,7 +977,7 @@ def page_user_request_out():
             else:
                 event_value = st.selectbox("Pilih Event", existing_events)
 
-        if st.button("Ajukan OUT (Manual)"):
+        if st.button("Tambah ke Daftar OUT"):
             if max_qty<1: st.error("Stok 0."); return
             if not str(event_value).strip(): st.error("Event wajib."); return
             selected_name=items[idx]["name"]
@@ -957,12 +987,9 @@ def page_user_request_out():
             base={"date": datetime.now().strftime("%Y-%m-%d"), "code": found_code if found_code else "-",
                   "item": selected_name, "qty": int(qty), "unit": items[idx].get("unit","-"),
                   "event": str(event_value).strip(), "trans_type": tipe, "user": st.session_state.username}
-            rec=normalize_out_record(base); rec["type"]="OUT"
-            pending_add_many(brand, [rec])
-            st.success("Request OUT diajukan & menunggu approval.")
-            st.rerun()
+            st.session_state.req_out_items.append(normalize_out_record(base))
+            st.success("Ditambahkan ke daftar OUT.")
 
-    # ---------- OUT Upload Excel (langsung insert pending) ----------
     with tab2:
         st.info("Format: **Tanggal | Kode Barang | Nama Barang | Qty | Event | Tipe**  (Tipe = Support/Penjualan)")
         inv_records=[{"code":c,"name":it.get("name","-")} for c,it in DATA["inventory"].items()]
@@ -971,7 +998,7 @@ def page_user_request_out():
                            file_name=f"Template_OUT_{st.session_state.current_brand.capitalize()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         fu=st.file_uploader("Upload File Excel OUT", type=["xlsx"], key="out_excel_uploader")
-        if fu and st.button("Proses Excel → Ajukan OUT"):
+        if fu and st.button("Tambah dari Excel → Daftar OUT"):
             try:
                 df_new=pd.read_excel(fu, engine="openpyxl")
             except Exception as e:
@@ -985,7 +1012,7 @@ def page_user_request_out():
             by_code={code:(it.get("name"), it.get("unit","-"), it.get("qty",0)) for code,it in inv.items()}
             by_name={it.get("name"):(code, it.get("unit","-"), it.get("qty",0)) for code,it in inv.items()}
 
-            to_insert=[]; errors=[]; added=0
+            added, errors = 0, []
             for ridx,row in df_new.iterrows():
                 try:
                     dt=pd.to_datetime(row["Tanggal"], errors="coerce")
@@ -1009,21 +1036,55 @@ def page_user_request_out():
                     if inv_stock is not None and qty_x>inv_stock: errors.append(f"Baris {ridx+2}: Qty ({qty_x}) > stok ({inv_stock})."); continue
                     base={"date": date_str, "code": inv_code, "item": inv_name, "qty": qty_x, "unit": inv_unit or "-",
                           "event": event_x, "trans_type": tipe_norm, "user": st.session_state.username}
-                    rec=normalize_out_record(base); rec["type"]="OUT"
-                    to_insert.append(rec); added+=1
+                    st.session_state.req_out_items.append(normalize_out_record(base)); added+=1
                 except Exception as e:
                     errors.append(f"Baris {ridx+2}: {e}")
-            if to_insert: pending_add_many(brand, to_insert)
-            if added: st.success(f"{added} baris OUT diajukan & menunggu approval.")
+            if added: st.success(f"{added} baris ditambahkan ke daftar OUT.")
             if errors: st.warning("Beberapa baris dilewati:\n- " + "\n- ".join(errors))
-            st.rerun()
 
+    # DAFTAR & SUBMIT OUT (multi)
+    if st.session_state.req_out_items:
+        st.divider()
+        st.subheader("Daftar Item Request OUT (Staged)")
+        df_out=pd.DataFrame(st.session_state.req_out_items)
+        pref_cols=[c for c in ["date","code","item","qty","unit","event","trans_type"] if c in df_out.columns]
+        df_out=df_out[pref_cols]
+        c1,c2=st.columns([1,1])
+        if c1.button("Pilih semua", key="out_sel_all"): st.session_state.out_select_flags=[True]*len(df_out)
+        if c2.button("Kosongkan pilihan", key="out_sel_none"): st.session_state.out_select_flags=[False]*len(df_out)
+        selected_idx=_render_staged_table(df_out, "out_select_flags", "editor_out_staged")
+
+        if st.button("Hapus Item Terpilih", key="delete_out"):
+            if selected_idx:
+                keep=[i for i in range(len(st.session_state.req_out_items)) if i not in selected_idx]
+                st.session_state.req_out_items=[st.session_state.req_out_items[i] for i in keep]
+                st.session_state.out_select_flags=[False]*len(st.session_state.req_out_items)
+                st.rerun()
+            else:
+                st.info("Tidak ada baris dipilih.")
+
+        if st.button("Ajukan Request OUT Terpilih"):
+            if not selected_idx:
+                st.warning("Pilih setidaknya satu item."); return
+            to_insert=[]
+            for i,rec in enumerate(st.session_state.req_out_items):
+                if i in selected_idx:
+                    r=rec.copy(); r["type"]="OUT"; to_insert.append(r)
+            if to_insert:
+                pending_add_many(st.session_state.current_brand, to_insert)
+                keep=[i for i in range(len(st.session_state.req_out_items)) if i not in selected_idx]
+                st.session_state.req_out_items=[st.session_state.req_out_items[i] for i in keep]
+                st.session_state.out_select_flags=[False]*len(st.session_state.req_out_items)
+                st.success(f"{len(to_insert)} request OUT diajukan & menunggu approval.")
+                st.rerun()
+
+# ---------- RETURN: MULTI-ITEM ----------
 def page_user_request_return():
-    st.markdown(f"## Request Retur - {st.session_state.current_brand.capitalize()}"); st.divider()
+    st.markdown(f"## Request Retur (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
     if not items: st.info("Belum ada master barang."); return
 
-    # event OUT approved map
+    # Peta event OUT approved per item
     hist=DATA.get("history", [])
     approved_out_map={}
     for h in hist:
@@ -1032,28 +1093,27 @@ def page_user_request_return():
             if it and ev and ev not in ["-",None,""]:
                 approved_out_map.setdefault(it, set()).add(ev)
 
-    tab1,tab2=st.tabs(["Input Manual","Upload Excel"])
+    tab1,tab2=st.tabs(["Tambah Manual","Tambah dari Excel"])
     with tab1:
-        col1,col2=st.columns(2)
-        idx=col1.selectbox("Pilih Barang", range(len(items)),
-                           format_func=lambda x: f"{items[x]['name']} (Stok Gudang: {items[x]['qty']} {items[x].get('unit','-')})")
-        qty=col2.number_input("Jumlah Retur", min_value=1, step=1)
+        c1,c2=st.columns(2)
+        idx=c1.selectbox("Pilih Barang", range(len(items)),
+                         format_func=lambda x: f"{items[x]['name']} (Stok Gudang: {items[x]['qty']} {items[x].get('unit','-')})")
+        qty=c2.number_input("Jumlah Retur", min_value=1, step=1)
         name=items[idx]["name"]; unit=items[idx].get("unit","-")
         events=sorted(list(approved_out_map.get(name,set())))
         if not events:
             st.warning("Belum ada event OUT disetujui untuk item ini."); ev_choice=None
         else:
             ev_choice=st.selectbox("Pilih Event (dari OUT yang disetujui)", events)
-        if st.button("Ajukan Retur (Manual)"):
+        if st.button("Tambah ke Daftar Retur"):
             if not ev_choice: st.error("Pilih event terlebih dahulu."); return
             brand=st.session_state.current_brand
             inv=load_brand_data(brand)["inventory"]
             code=next((c for c,it in inv.items() if it.get("name")==name), "-")
             base={"date": datetime.now().strftime("%Y-%m-%d"), "code": code, "item": name, "qty": int(qty),
                   "unit": unit, "event": ev_choice, "user": st.session_state.username}
-            rec=normalize_return_record(base); rec["type"]="RETURN"
-            pending_add_many(brand,[rec])
-            st.success("Request RETUR diajukan & menunggu approval."); st.rerun()
+            st.session_state.req_ret_items.append(normalize_return_record(base))
+            st.success("Ditambahkan ke daftar Retur.")
 
     with tab2:
         st.info("Format: **Tanggal | Kode Barang | Nama Barang | Qty | Event**")
@@ -1063,7 +1123,7 @@ def page_user_request_return():
                            file_name=f"Template_Retur_{st.session_state.current_brand.capitalize()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         fu=st.file_uploader("Upload File Excel Retur", type=["xlsx"], key="ret_excel_uploader")
-        if fu and st.button("Proses Excel → Ajukan Retur"):
+        if fu and st.button("Tambah dari Excel → Daftar Retur"):
             try:
                 df_new=pd.read_excel(fu, engine="openpyxl")
             except Exception as e:
@@ -1085,7 +1145,7 @@ def page_user_request_return():
                     if it and ev and ev not in ["-",None,""]:
                         approved_out_map.setdefault(it, set()).add(ev)
 
-            to_insert=[]; errors=[]; added=0
+            added, errors = 0, []
             for ridx,row in df_new.iterrows():
                 try:
                     dt=pd.to_datetime(row["Tanggal"], errors="coerce")
@@ -1108,14 +1168,47 @@ def page_user_request_return():
                     base={"date": date_str, "code": inv_code if inv_code else "-", "item": inv_name,
                           "qty": qty_x, "unit": inv_unit if inv_unit else "-", "event": event_x,
                           "user": st.session_state.username}
-                    rec=normalize_return_record(base); rec["type"]="RETURN"
-                    to_insert.append(rec); added+=1
+                    st.session_state.req_ret_items.append(normalize_return_record(base)); added+=1
                 except Exception as e:
                     errors.append(f"Baris {ridx+2}: {e}")
-            if to_insert: pending_add_many(brand, to_insert)
-            if added: st.success(f"{added} baris RETUR diajukan & menunggu approval.")
+            if added: st.success(f"{added} baris ditambahkan ke daftar Retur.")
             if errors: st.warning("Beberapa baris gagal:\n- " + "\n- ".join(errors))
-            st.rerun()
+
+    # DAFTAR & SUBMIT RETUR (multi)
+    if st.session_state.req_ret_items:
+        st.divider()
+        st.subheader("Daftar Item Request Retur (Staged)")
+        df_ret=pd.DataFrame(st.session_state.req_ret_items)
+        pref_cols=[c for c in ["date","code","item","qty","unit","event"] if c in df_ret.columns]
+        df_ret=df_ret[pref_cols]
+        r1,r2=st.columns([1,1])
+        if r1.button("Pilih semua", key="ret_sel_all"): st.session_state.ret_select_flags=[True]*len(df_ret)
+        if r2.button("Kosongkan pilihan", key="ret_sel_none"): st.session_state.ret_select_flags=[False]*len(df_ret)
+        selected_idx=_render_staged_table(df_ret, "ret_select_flags", "editor_ret_staged")
+
+        if st.button("Hapus Item Terpilih", key="delete_ret"):
+            if selected_idx:
+                keep=[i for i in range(len(st.session_state.req_ret_items)) if i not in selected_idx]
+                st.session_state.req_ret_items=[st.session_state.req_ret_items[i] for i in keep]
+                st.session_state.ret_select_flags=[False]*len(st.session_state.req_ret_items)
+                st.rerun()
+            else:
+                st.info("Tidak ada baris dipilih.")
+
+        if st.button("Ajukan Request Retur Terpilih"):
+            if not selected_idx:
+                st.warning("Pilih setidaknya satu item."); return
+            to_insert=[]
+            for i,rec in enumerate(st.session_state.req_ret_items):
+                if i in selected_idx:
+                    r=rec.copy(); r["type"]="RETURN"; to_insert.append(r)
+            if to_insert:
+                pending_add_many(st.session_state.current_brand, to_insert)
+                keep=[i for i in range(len(st.session_state.req_ret_items)) if i not in selected_idx]
+                st.session_state.req_ret_items=[st.session_state.req_ret_items[i] for i in keep]
+                st.session_state.ret_select_flags=[False]*len(st.session_state.req_ret_items)
+                st.success(f"{len(to_insert)} request RETUR diajukan & menunggu approval.")
+                st.rerun()
 
 def page_user_riwayat():
     st.markdown(f"## Riwayat Saya - {st.session_state.current_brand.capitalize()}"); st.divider()

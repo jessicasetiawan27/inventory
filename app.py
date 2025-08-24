@@ -1,9 +1,16 @@
 # app.py — Inventory app lengkap (Streamlit + Supabase)
-# Fitur: Login (admin/approver/user), Dashboard, Lihat Stok, Stock Card,
-# Tambah Master (manual + Excel), Request IN/OUT/RETURN, Approve/Reject,
-# Riwayat & Export, Reset Pending/History
-# Catatan: file upload (PDF DO) disimpan lokal (ephemeral) di Streamlit Cloud (untuk dev cepat).
-#         Untuk produksi jangka panjang, sebaiknya pakai Supabase Storage (bisa ditambahkan belakangan).
+# Fitur:
+# - Login (admin/approver/user)
+# - Dashboard, Lihat Stok, Stock Card
+# - Tambah Master (manual + Excel)
+# - Request IN (pilih master / input manual + DO wajib)
+# - Request OUT (pilih master / input manual)
+# - Request RETURN
+# - Approve/Reject (admin/approver) — auto-buat master item bila IN/RETURN code belum ada
+# - Riwayat & Export, Reset data
+#
+# Catatan: file upload (PDF DO) disimpan lokal (ephemeral) di disk instance Streamlit.
+# Untuk produksi jangka panjang, migrasikan ke Supabase Storage.
 
 import os
 from io import BytesIO
@@ -22,7 +29,7 @@ try:
 except Exception:
     pass
 
-# Styling sederhana (mirip "before")
+# Styling sederhana
 st.markdown("""
 <style>
 .main { background-color: #F8FAFC; }
@@ -60,9 +67,6 @@ UPLOADS_DIR = "uploads"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 TRANS_TYPES = ["Support", "Penjualan"]  # untuk OUT
-
-def now_iso():
-    return datetime.now().isoformat()
 
 def ts_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -102,7 +106,6 @@ def load_inventory_df():
     df = pd.DataFrame(data)
     if df.empty:
         return df
-    # Pastikan kolom standar
     for c in ["code", "item", "unit", "qty", "category"]:
         if c not in df.columns:
             df[c] = None
@@ -224,12 +227,10 @@ def render_dashboard():
         if c not in d.columns: d[c] = None
     d["qty"] = pd.to_numeric(d["qty"], errors="coerce").fillna(0).astype(int)
 
-    # tanggal efektif: gunakan 'date' kalau ada, else dari 'timestamp'
     d["date_eff"] = pd.to_datetime(d["date"], errors="coerce")
     d["date_eff"] = d["date_eff"].fillna(pd.to_datetime(d["timestamp"], errors="coerce"))
     d = d.dropna(subset=["date_eff"]).copy()
 
-    # type_norm dari action
     act = d["action"].astype(str).str.upper()
     d["type_norm"] = "-"
     d.loc[act.str.contains("ADD_ITEM"), "type_norm"] = "IN"
@@ -299,7 +300,6 @@ def render_stock_card():
     nama = st.selectbox("Pilih Barang", items)
     if not nama:
         return
-    # ambil history terkait item
     h = df_hist.copy()
     if h.empty:
         st.info("Belum ada riwayat.")
@@ -310,7 +310,6 @@ def render_stock_card():
         st.info("Belum ada transaksi disetujui untuk item ini.")
         return
 
-    # urutkan waktu
     h["ts"] = pd.to_datetime(h["timestamp"], errors="coerce")
     h = h.sort_values("ts")
     saldo = 0
@@ -416,7 +415,6 @@ def render_request_in():
                 st.error("Nomor Surat Jalan wajib diisi."); return
             if not file_pdf:
                 st.error("PDF Surat Jalan wajib diupload."); return
-            # simpan file (ephemeral)
             ts = datetime.now().strftime("%Y%m%d%H%M%S")
             path = os.path.join(UPLOADS_DIR, f"DO_{st.session_state.auth['username']}_{ts}.pdf")
             with open(path, "wb") as f:
@@ -574,7 +572,6 @@ def render_approve():
     if df_pend.empty:
         st.info("Tidak ada pending request.")
         return
-    # pastikan kolom lengkap
     d = df_pend.copy()
     for c in ["id","type","date","code","item","qty","unit","trans_type","event","do_number","attachment","user","timestamp"]:
         if c not in d.columns: d[c] = None
@@ -595,66 +592,86 @@ def render_approve():
             st.warning("Pilih minimal satu ID."); return
         # muat inventory terbaru
         inv = load_inventory_df()
-inv_by_code = {r["code"]: r for _, r in inv.iterrows()}
-approved = 0
-for id_ in pick:
-    row = d[d["id"] == id_].iloc[0].to_dict()
-    code, qty, rtype = row["code"], int(row["qty"]), str(row["type"]).upper()
+        inv_by_code = {r["code"]: r for _, r in inv.iterrows()}
+        approved = 0
+        for id_ in pick:
+            row = d[d["id"] == id_].iloc[0].to_dict()
+            code, qty, rtype = row["code"], int(row["qty"]), str(row["type"]).upper()
 
-    # Jika belum ada di master:
-    if code not in inv_by_code:
-        if rtype in ("IN", "RETURN"):
-            # buat master item baru dengan qty 0, kemudian diproses normal
-            inv_insert(
-                code=code,
-                item=row.get("item","-"),
-                qty=0,
-                unit=row.get("unit","-"),
-                category="Uncategorized"
-            )
-            # refresh mapping lokal
-            inv_by_code[code] = {"code": code, "item": row.get("item","-"), "unit": row.get("unit","-"), "qty": 0}
-        else:  # OUT but item not found
-            st.error(f"Code {code} tidak ditemukan di inventory. OUT tidak bisa diproses."); 
-            continue
+            # Jika belum ada di master:
+            if code not in inv_by_code:
+                if rtype in ("IN", "RETURN"):
+                    # buat master item baru dengan qty 0, kemudian diproses normal
+                    inv_insert(
+                        code=code,
+                        item=row.get("item","-"),
+                        qty=0,
+                        unit=row.get("unit","-"),
+                        category="Uncategorized"
+                    )
+                    # refresh mapping lokal
+                    inv_by_code[code] = {"code": code, "item": row.get("item","-"), "unit": row.get("unit","-"), "qty": 0}
+                else:  # OUT but item not found
+                    st.error(f"Code {code} tidak ditemukan di inventory. OUT tidak bisa diproses."); 
+                    continue
 
-    cur = int(inv_by_code[code]["qty"])
-    if rtype == "IN":
-        new = cur + qty
-    elif rtype == "OUT":
-        if qty > cur:
-            st.error(f"Qty OUT > stok untuk {code}. Lewati."); 
-            continue
-        new = cur - qty
-    elif rtype == "RETURN":
-        new = cur + qty
-    else:
-        st.error(f"Tipe tidak dikenal: {rtype}")
-        continue
+            cur = int(inv_by_code[code]["qty"])
+            if rtype == "IN":
+                new = cur + qty
+            elif rtype == "OUT":
+                if qty > cur:
+                    st.error(f"Qty OUT > stok untuk {code}. Lewati."); 
+                    continue
+                new = cur - qty
+            elif rtype == "RETURN":
+                new = cur + qty
+            else:
+                st.error(f"Tipe tidak dikenal: {rtype}")
+                continue
 
-    # update inventory
-    inv_update_qty(code, new)
+            # update inventory
+            inv_update_qty(code, new)
 
-    # catat history
-    history_add({
-        "action": f"APPROVE_{rtype}",
-        "date": row.get("date"),
-        "code": code, "item": row.get("item"),
-        "qty": qty, "stock": new, "unit": row.get("unit"),
-        "trans_type": row.get("trans_type"),
-        "event": row.get("event"), "do_number": row.get("do_number"),
-        "attachment": row.get("attachment"), "user": row.get("user"),
-        "timestamp": ts_text()
-    })
+            # catat history
+            history_add({
+                "action": f"APPROVE_{rtype}",
+                "date": row.get("date"),
+                "code": code, "item": row.get("item"),
+                "qty": qty, "stock": new, "unit": row.get("unit"),
+                "trans_type": row.get("trans_type"),
+                "event": row.get("event"), "do_number": row.get("do_number"),
+                "attachment": row.get("attachment"), "user": row.get("user"),
+                "timestamp": ts_text()
+            })
 
-    # hapus pending
-    pending_delete(id_)
-    # update cache & map stok lokal
-    inv_by_code[code]["qty"] = new
-    approved += 1
+            # hapus pending
+            pending_delete(id_)
+            # update cache & map stok lokal
+            inv_by_code[code]["qty"] = new
+            approved += 1
+        st.success(f"Berhasil approve {approved} request.")
+        st.experimental_rerun()
 
-st.success(f"Berhasil approve {approved} request.")
-st.experimental_rerun()
+    if col2.button("Reject Selected"):
+        if not pick:
+            st.warning("Pilih minimal satu ID."); return
+        rejected = 0
+        for id_ in pick:
+            row = d[d["id"] == id_].iloc[0].to_dict()
+            history_add({
+                "action": f"REJECT_{str(row.get('type','-')).upper()}",
+                "date": row.get("date"),
+                "code": row.get("code"), "item": row.get("item"),
+                "qty": int(row.get("qty",0)), "stock": None, "unit": row.get("unit"),
+                "trans_type": row.get("trans_type"),
+                "event": row.get("event"), "do_number": row.get("do_number"),
+                "attachment": row.get("attachment"), "user": row.get("user"),
+                "timestamp": ts_text()
+            })
+            pending_delete(id_)
+            rejected += 1
+        st.success(f"Berhasil reject {rejected} request.")
+        st.experimental_rerun()
 
 # ================== RIWAYAT & EXPORT ==================
 def render_riwayat():
@@ -665,7 +682,6 @@ def render_riwayat():
     d = df_hist.copy()
     for c in ["action","date","code","item","qty","stock","unit","trans_type","user","event","do_number","timestamp","attachment"]:
         if c not in d.columns: d[c] = None
-    # Filter
     d["date_only"] = pd.to_datetime(d["date"].fillna(d["timestamp"]), errors="coerce").dt.date
     col1, col2 = st.columns(2)
     start = col1.date_input("Tanggal mulai", value=d["date_only"].min())
@@ -715,7 +731,6 @@ def render_reset():
     st.warning("Aksi ini tidak dapat dibatalkan. Inventori tidak dihapus.")
     confirm = st.text_input("Ketik: RESET")
     if st.button("Hapus Pending & History") and confirm == "RESET":
-        # kosongkan pending & history
         supabase.from_("pending_gulavit").delete().neq("id", -1).execute()
         supabase.from_("history_gulavit").delete().neq("id", -1).execute()
         clear_cache()

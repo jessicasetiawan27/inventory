@@ -1,12 +1,14 @@
-# app.py — Supabase Inventory (multi-brand) dengan staging multi-item:
+# app.py — Supabase Inventory (multi-brand)
+# Fitur utama:
 # - IN: manual + Excel → tambah ke daftar → Ajukan (DO & PDF diterapkan ke baris terpilih)
 # - OUT: manual + Excel → tambah ke daftar → Ajukan
 # - RETURN: manual + Excel → tambah ke daftar → Ajukan
-# - Approve IN auto-create item baru jika belum ada
+# - Approve IN: TIDAK auto-generate kode; WAJIB kode. Jika kode belum ada → dibuat pakai kode tsb
 # - Stock Card running balance (urut date->timestamp)
 # - Riwayat: status PENDING/APPROVED/REJECTED
+# - DB Health Check + tombol Refresh Data
 # Prasyarat: tabel per brand (inventory_*, pending_*, history_*), users_gulavit
-# Secrets: SUPABASE_URL, SUPABASE_KEY  (opsional passwords.admin/user buat fallback)
+# Secrets: SUPABASE_URL, SUPABASE_KEY
 
 import os
 import base64
@@ -18,15 +20,15 @@ import streamlit as st
 from supabase import create_client, Client
 
 # -------------------- CONFIG --------------------
-BANNER_URL = "https://media.licdn.com/dms/image/v2/D563DAQFDri8xlKNIvg/image-scale_191_1128/image-scale_191_1128/0/1678337293506/pesona_inti_rasa_cover?e=2147483647&v=beta&t=vHi0xtyAZsT9clHb0yBYPE8M9IaO2dNY6Cb_Vs3Ddlo"
-ICON_URL   = "https://i.ibb.co/7C96T9y/favicon.png"
+BANNER_URL  = "https://media.licdn.com/dms/image/v2/D563DAQFDri8xlKNIvg/image-scale_191_1128/image-scale_191_1128/0/1678337293506/pesona_inti_rasa_cover?e=2147483647&v=beta&t=vHi0xtyAZsT9clHb0yBYPE8M9IaO2dNY6Cb_Vs3Ddlo"
+ICON_URL    = "https://i.ibb.co/7C96T9y/favicon.png"
 UPLOADS_DIR = "uploads"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-BRANDS = ["gulavit","takokak"]
+BRANDS = ["gulavit", "takokak"]
 TABLES = {
-    "gulavit": {"inv":"inventory_gulavit","pend":"pending_gulavit","hist":"history_gulavit"},
-    "takokak": {"inv":"inventory_takokak","pend":"pending_takokak","hist":"history_takokak"},
+    "gulavit": {"inv": "inventory_gulavit", "pend": "pending_gulavit", "hist": "history_gulavit"},
+    "takokak": {"inv": "inventory_takokak", "pend": "pending_takokak", "hist": "history_takokak"},
 }
 USERS_TABLE = "users_gulavit"
 
@@ -34,13 +36,6 @@ TRANS_TYPES = ["Support", "Penjualan"]
 STD_REQ_COLS = ["date","code","item","qty","unit","event","trans_type","do_number","attachment","user","timestamp"]
 
 st.set_page_config(page_title="Inventory System", page_icon=ICON_URL, layout="wide")
-
-# alias st.experimental_rerun → st.rerun jika perlu
-try:
-    if not hasattr(st, "experimental_rerun"):
-        st.experimental_rerun = st.rerun
-except Exception:
-    pass
 
 # Styles
 st.markdown("""
@@ -55,6 +50,7 @@ h1, h2, h3 { color: #0F172A; }
 .stButton>button:hover { background-color:#0284C7;color:#fff; }
 .smallcap{ font-size:12px;color:#64748B; }
 .card { background:#fff;border:1px solid #E2E8F0;border-radius:14px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,.04);height:100%; }
+.badge { display:inline-block;padding:.2rem .5rem;border-radius:6px;background:#ECFDF5;color:#065F46;font-size:12px;border:1px solid #A7F3D0;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -130,7 +126,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame, sheet="Sheet1") -> bytes:
 
 def make_master_template_bytes() -> bytes:
     cols = ["Kode Barang", "Nama Barang", "Qty", "Satuan", "Kategori"]
-    df_tmpl = pd.DataFrame([{"Kode Barang":"ITM-0001","Nama Barang":"Contoh Produk","Qty":10,"Satuan":"pcs","Kategori":"Umum"}], columns=cols)
+    df_tmpl = pd.DataFrame([{"Kode Barang":"ITM-0001","Nama Barang":"Contoh Produk","Qty":10,"Satuan":"PCS","Kategori":"Umum"}], columns=cols)
     return dataframe_to_excel_bytes(df_tmpl, "Template Master")
 
 def make_out_template_bytes(inv_records: list) -> bytes:
@@ -152,7 +148,7 @@ def make_in_template_bytes(inv_records: list) -> bytes:
         for r in inv_records[:2]:
             rows.append({"Tanggal":today,"Kode Barang":r["code"],"Nama Barang":r["name"],"Qty":5,"Unit (opsional)":"","Event (opsional)":""})
     else:
-        rows.append({"Tanggal":today,"Kode Barang":"ITM-0001","Nama Barang":"Contoh Produk","Qty":10,"Unit (opsional)":"pcs","Event (opsional)":""})
+        rows.append({"Tanggal":today,"Kode Barang":"ITM-0001","Nama Barang":"Contoh Produk","Qty":10,"Unit (opsional)":"PCS","Event (opsional)":""})
     return dataframe_to_excel_bytes(pd.DataFrame(rows, columns=cols), "Template IN")
 
 def make_return_template_bytes(inv_records: list) -> bytes:
@@ -166,9 +162,8 @@ def make_return_template_bytes(inv_records: list) -> bytes:
         rows.append({"Tanggal":today,"Kode Barang":"ITM-0001","Nama Barang":"Contoh Produk","Qty":1,"Event":"Contoh event"})
     return dataframe_to_excel_bytes(pd.DataFrame(rows, columns=cols), "Template Retur")
 
-
 # -------------------- READS --------------------
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_users() -> dict:
     try:
         res = supabase.from_(USERS_TABLE).select("*").execute()
@@ -197,34 +192,9 @@ def _safe_select(table: str) -> pd.DataFrame:
         st.warning(f"Tabel '{table}' tidak bisa dibaca: {e}")
         return pd.DataFrame([])
 
-def _alias_inventory_frame(df_inv_raw: pd.DataFrame) -> pd.DataFrame:
-    """Kompatibilitas: balance→qty, name→item."""
-    df = df_inv_raw.copy()
-    if df.empty:
-        for c in ["code","item","qty","unit","category"]:
-            if c not in df.columns:
-                df[c] = None
-        return df[["code","item","qty","unit","category"]]
-
-    # name → item
-    if "item" not in df.columns and "name" in df.columns:
-        df = df.rename(columns={"name": "item"})
-    # balance → qty
-    if "qty" not in df.columns and "balance" in df.columns:
-        df = df.rename(columns={"balance": "qty"})
-
-    for c in ["code","item","qty","unit","category"]:
-        if c not in df.columns:
-            df[c] = None
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
-    df["item"] = df["item"].astype(str).fillna("-")
-    return df[["code","item","qty","unit","category"]]
-
 def load_brand_data(brand: str) -> dict:
     t = TABLES[brand]
-    df_inv_raw  = _safe_select(t["inv"])
-    df_inv = _alias_inventory_frame(df_inv_raw)
-
+    df_inv  = _safe_select(t["inv"])
     df_pend = _safe_select(t["pend"])
     df_hist = _safe_select(t["hist"])
 
@@ -233,7 +203,7 @@ def load_brand_data(brand: str) -> dict:
         for _, r in df_inv.iterrows():
             inv[str(r.get("code","-"))] = {
                 "name": str(r.get("item","-")),
-                "qty": int(pd.to_numeric(r.get("qty",0), errors="coerce") or 0),
+                "qty":  int(pd.to_numeric(r.get("qty",0), errors="coerce") or 0),
                 "unit": str(r.get("unit","-")) if pd.notna(r.get("unit")) else "-",
                 "category": str(r.get("category","Uncategorized")) if pd.notna(r.get("category")) else "Uncategorized",
             }
@@ -254,28 +224,13 @@ def invalidate_cache(): st.cache_data.clear()
 
 # -------------------- WRITES --------------------
 def inv_insert_raw(brand, payload: dict):
-    """Insert kompatibel: tulis (item & name) + (qty & balance) bila ada."""
     t = TABLES[brand]
-    p = payload.copy()
-    # gandakan kolom kompat
-    if "item" in p and "name" not in p: p["name"] = p["item"]
-    if "name" in p and "item" not in p: p["item"] = p["name"]
-    if "qty" in p and "balance" not in p: p["balance"] = p["qty"]
-    if "balance" in p and "qty" not in p: p["qty"] = p["balance"]
-    supabase.from_(t["inv"]).insert(p).execute()
+    supabase.from_(t["inv"]).insert(payload).execute()
     invalidate_cache()
 
-def inv_update_qty(brand, code, new_qty: int):
-    """Update qty; fallback ke 'balance' jika kolom 'qty' tidak ada."""
+def inv_update_qty(brand, code, new_qty):
     t = TABLES[brand]
-    try:
-        supabase.from_(t["inv"]).update({"qty": int(new_qty), "balance": int(new_qty)}).eq("code", code).execute()
-    except Exception:
-        # fallback 1 kolom
-        try:
-            supabase.from_(t["inv"]).update({"qty": int(new_qty)}).eq("code", code).execute()
-        except Exception:
-            supabase.from_(t["inv"]).update({"balance": int(new_qty)}).eq("code", code).execute()
+    supabase.from_(t["inv"]).update({"qty": int(new_qty)}).eq("code", code).execute()
     invalidate_cache()
 
 def pending_add_many(brand, records: list):
@@ -285,17 +240,10 @@ def pending_add_many(brand, records: list):
     invalidate_cache()
 
 def pending_delete_by_ids(brand, ids: list):
-    """Hapus by id; fallback by timestamp kalau id None."""
     t = TABLES[brand]
-    if ids:
-        for chunk in [ids[i:i+1000] for i in range(0, len(ids), 1000)]:
-            supabase.from_(t["pend"]).delete().in_("id", chunk).execute()
-    invalidate_cache()
-
-def pending_delete_by_timestamps(brand, timestamps: list):
-    t = TABLES[brand]
-    for ts in timestamps:
-        supabase.from_(t["pend"]).delete().eq("timestamp", ts).execute()
+    if not ids: return
+    for chunk in [ids[i:i+1000] for i in range(0, len(ids), 1000)]:
+        supabase.from_(t["pend"]).delete().in_("id", chunk).execute()
     invalidate_cache()
 
 def history_add(brand, rec: dict):
@@ -516,13 +464,12 @@ st.sidebar.divider()
 brand_choice = st.sidebar.selectbox("Pilih Brand", BRANDS, format_func=lambda x: x.capitalize(),
                                     index=BRANDS.index(st.session_state.get("current_brand","gulavit")))
 st.session_state.current_brand = brand_choice
-DATA = load_brand_data(brand_choice)
 
-def _do_refresh():
+# Refresh Data button
+if st.sidebar.button("🔄 Refresh data"):
     invalidate_cache()
+    st.success("Cache dibersihkan & data akan dimuat ulang.")
     st.rerun()
-
-st.sidebar.button("🔄 Refresh data", on_click=_do_refresh)
 
 if st.sidebar.button("🚪 Logout"):
     st.session_state.logged_in=False
@@ -539,9 +486,10 @@ if st.session_state.notification:
     st.session_state.notification=None
 
 # -------------------- ADMIN PAGES --------------------
-def page_admin_dashboard(): render_dashboard_pro(DATA, st.session_state.current_brand.capitalize(), allow_download=False)
+def page_admin_dashboard(): render_dashboard_pro(load_brand_data(st.session_state.current_brand), st.session_state.current_brand.capitalize(), allow_download=False)
 
 def page_admin_lihat_stok():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Stok Barang - {st.session_state.current_brand.capitalize()}"); st.divider()
     inv = DATA["inventory"]
     if not inv: st.info("Belum ada barang."); return
@@ -557,6 +505,7 @@ def page_admin_lihat_stok():
     st.dataframe(view, use_container_width=True, hide_index=True)
 
 def page_admin_stock_card():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Stock Card - {st.session_state.current_brand.capitalize()}"); st.divider()
     hist=DATA["history"]
     if not hist: st.info("Belum ada riwayat."); return
@@ -580,7 +529,7 @@ def page_admin_stock_card():
             t_in=qty; saldo+=qty; ket="Initial Stock"
         elif act=="APPROVE_IN":
             t_in=qty; saldo+=qty
-            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and str(do).strip()!='-' else "")
+            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and do!='- ' else "")
         elif act=="APPROVE_OUT":
             t_out=qty; saldo-=qty
             ket=f"Request OUT ({h.get('trans_type','-')}) by {h.get('user','-')} — Event: {h.get('event','-')}"
@@ -592,14 +541,15 @@ def page_admin_stock_card():
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 def page_admin_tambah_master():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Tambah Master Barang - {st.session_state.current_brand.capitalize()}"); st.divider()
     tab1, tab2 = st.tabs(["Input Manual","Upload Excel"])
     with tab1:
         code=st.text_input("Kode Barang (unik & wajib)", placeholder="ITM-0001")
-        name=st.text_input("Nama Barang")
-        unit=st.text_input("Satuan (pcs/box/liter)")
+        name=st.text_input("Nama Barang (wajib)")
+        unit=st.text_input("Satuan (PCS/BOX/LITER)", value="PCS")
         qty=st.number_input("Jumlah Stok Awal", min_value=0, step=1)
-        cat=st.text_input("Kategori", placeholder="Umum/Minuman/Makanan")
+        cat=st.text_input("Kategori", placeholder="Umum/Minuman/Makanan", value="Umum")
         if st.button("Tambah Barang Manual"):
             inv=DATA["inventory"]
             if not code.strip(): st.error("Kode wajib."); return
@@ -612,7 +562,7 @@ def page_admin_tambah_master():
                                                          "timestamp":ts_text(),"date":datetime.now().strftime("%Y-%m-%d"),
                                                          "code":code.strip(),"trans_type":None,"do_number":"-","attachment":None})
             st.success(f"Barang '{name}' ditambahkan.")
-            st.experimental_rerun()
+            st.rerun()
     with tab2:
         st.info("Format: **Kode Barang | Nama Barang | Qty | Satuan | Kategori**")
         st.download_button("📥 Unduh Template Master Excel", data=make_master_template_bytes(),
@@ -643,11 +593,12 @@ def page_admin_tambah_master():
                     added+=1
                 if added: st.success(f"{added} item master ditambahkan.")
                 if errors: st.warning("Beberapa baris dilewati:\n- " + "\n- ".join(errors))
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 st.error(f"Gagal membaca Excel: {e}")
 
 def page_admin_approve():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Approve / Reject Request - {st.session_state.current_brand.capitalize()}"); st.divider()
     pend=DATA["pending_requests"]
     if not pend: st.info("Tidak ada pending request."); return
@@ -673,33 +624,44 @@ def page_admin_approve():
     if col1.button("Approve Selected"):
         if not selected_idx:
             st.session_state.notification={"type":"warning","message":"Pilih setidaknya satu item."}; st.rerun()
+
         brand=st.session_state.current_brand
         t=TABLES[brand]
-        inv_map = load_brand_data(brand)["inventory"]  # fresh
+
+        # muat map inventory by code & by name
+        inv_map = load_brand_data(brand)["inventory"]
+        inv_by_name = {it["name"]: code for code, it in inv_map.items()}
+
         approved_ids=[]
-        fallback_ts=[]
+        errors=[]
         for i in selected_idx:
             req=pend[i]
             qty=int(pd.to_numeric(req["qty"], errors="coerce") or 0)
             ttype=str(req["type"]).upper()
+            req_code=(str(req.get("code") or "").strip())
+            req_name=str(req.get("item") or "").strip()
 
-            found_code=None
-            for code,it in inv_map.items():
-                if it.get("name")==req["item"]:
-                    found_code=code; break
+            # ---------- IN ----------
+            if ttype=="IN":
+                if not req_code or req_code=="-":
+                    errors.append(f"IN '{req_name}': Kode Barang wajib ada. Dilewati.")
+                    continue
+                if req_code not in inv_map:
+                    # buat item baru persis dengan kode tsb
+                    inv_insert_raw(brand, {"code":req_code, "item":req_name, "qty":0,
+                                           "unit":req.get("unit","-"), "category":"Uncategorized"})
+                    inv_map[req_code]={"name":req_name,"qty":0,"unit":req.get("unit","-"),"category":"Uncategorized"}
+                found_code=req_code
 
-            if ttype=="IN" and found_code is None:
-                code_candidate = str(req.get("code") or "").strip()
-                if (not code_candidate) or code_candidate=="-" or (code_candidate in inv_map):
-                    code_candidate = f"NEW-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                inv_insert_raw(brand, {"code":code_candidate, "item":req["item"], "qty":0,
-                                       "unit":req.get("unit","-"), "category":"Uncategorized"})
-                inv_map[code_candidate]={"name":req["item"],"qty":0,"unit":req.get("unit","-"),"category":"Uncategorized"}
-                found_code=code_candidate
-
-            if found_code is None:
-                st.warning(f"Item '{req['item']}' tidak ditemukan; lewati.")
-                continue
+            # ---------- OUT / RETURN ----------
+            else:
+                if req_code and (req_code in inv_map):
+                    found_code=req_code
+                else:
+                    found_code=inv_by_name.get(req_name)
+                if not found_code:
+                    errors.append(f"{ttype} '{req_name}': Item tidak ada di inventory. Dilewati.")
+                    continue
 
             cur=int(inv_map[found_code]["qty"])
             if ttype=="IN":
@@ -709,28 +671,23 @@ def page_admin_approve():
             elif ttype=="RETURN":
                 new_qty=cur+qty
             else:
-                st.warning(f"Tipe tidak dikenali: {ttype}"); continue
+                errors.append(f"Tipe tidak dikenali: {ttype}"); continue
 
             inv_update_qty(brand, found_code, new_qty)
             inv_map[found_code]["qty"]=new_qty
 
-            history_add(brand, {"action":f"APPROVE_{ttype}","item":req["item"],"qty":qty,"stock":new_qty,
+            history_add(brand, {"action":f"APPROVE_{ttype}","item":req_name,"qty":qty,"stock":new_qty,
                                 "unit":req.get("unit","-"),"user":req.get("user", st.session_state.username),
                                 "event":req.get("event","-"),"do_number":req.get("do_number","-"),
                                 "attachment":req.get("attachment"),"timestamp":ts_text(),"date":req.get("date"),
                                 "code":found_code,"trans_type":req.get("trans_type")})
-            if req.get("id") is not None:
-                approved_ids.append(req.get("id"))
-            else:
-                fallback_ts.append(req.get("timestamp"))
+            approved_ids.append(req.get("id"))
 
         if approved_ids:
             pending_delete_by_ids(brand, approved_ids)
-        if fallback_ts:
-            pending_delete_by_timestamps(brand, fallback_ts)
-
-        if approved_ids or fallback_ts:
-            st.session_state.notification={"type":"success","message":"Request terpilih di-approve."}
+            msg=f"{len(approved_ids)} request di-approve."
+            if errors: msg+=f" Namun ada yang dilewati:\n- " + "\n- ".join(errors)
+            st.session_state.notification={"type":"success","message":msg}
         else:
             st.session_state.notification={"type":"warning","message":"Tidak ada request valid yang diproses."}
         st.rerun()
@@ -739,7 +696,7 @@ def page_admin_approve():
         if not selected_idx:
             st.session_state.notification={"type":"warning","message":"Pilih setidaknya satu item."}; st.rerun()
         brand=st.session_state.current_brand
-        rejected_ids=[]; fallback_ts=[]
+        rejected_ids=[]
         for i in selected_idx:
             req=pend[i]
             history_add(brand, {"action":f"REJECT_{str(req.get('type','-')).upper()}","item":req.get("item","-"),
@@ -748,19 +705,14 @@ def page_admin_approve():
                                 "event":req.get("event","-"),"do_number":req.get("do_number","-"),
                                 "attachment":req.get("attachment"),"timestamp":ts_text(),
                                 "date":req.get("date"),"code":req.get("code"),"trans_type":req.get("trans_type")})
-            if req.get("id") is not None:
-                rejected_ids.append(req.get("id"))
-            else:
-                fallback_ts.append(req.get("timestamp"))
+            rejected_ids.append(req.get("id"))
         if rejected_ids:
             pending_delete_by_ids(brand, rejected_ids)
-        if fallback_ts:
-            pending_delete_by_timestamps(brand, fallback_ts)
-
-        st.session_state.notification={"type":"success","message":"Request terpilih di-reject."}
+            st.session_state.notification={"type":"success","message":f"{len(rejected_ids)} request di-reject."}
         st.rerun()
 
 def page_admin_riwayat():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Riwayat Lengkap - {st.session_state.current_brand.capitalize()}"); st.divider()
     hist=DATA["history"]
     if not hist: st.info("Belum ada riwayat."); return
@@ -801,6 +753,7 @@ def page_admin_riwayat():
     st.markdown(view[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
 
 def page_admin_export():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Export Laporan - {st.session_state.current_brand.capitalize()}"); st.divider()
     inv=DATA["inventory"]
     if not inv: st.info("Tidak ada data."); return
@@ -833,16 +786,14 @@ def page_admin_reset():
         st.rerun()
 
 def page_admin_db_health():
-    st.markdown(f"## DB Health Check — {st.session_state.current_brand.capitalize()}"); st.divider()
-    st.write("Supabase URL:", SUPABASE_URL)
+    DATA = load_brand_data(st.session_state.current_brand)
+    st.markdown(f"## DB Health Check — {st.session_state.current_brand.capitalize()}")
+    st.caption("Cek koneksi & jumlah baris tabel.")
+    st.markdown(f"<span class='badge'>Supabase URL:</span> <code>{SUPABASE_URL}</code>", unsafe_allow_html=True)
     t = TABLES[st.session_state.current_brand]
     for label, tbl in [("Inventory", t["inv"]), ("Pending", t["pend"]), ("History", t["hist"])]:
-        try:
-            res = supabase.from_(tbl).select("*").execute()
-            cnt = len(res.data or [])
-            st.success(f"{label} ({tbl}) → {cnt} rows")
-        except Exception as e:
-            st.error(f"Gagal baca {tbl}: {e}")
+        df = _safe_select(tbl)
+        st.success(f"{label} ({tbl}) → {len(df)} rows")
 
 # -------------------- USER PAGES --------------------
 def _existing_events_for_out(brand: str) -> list:
@@ -874,12 +825,13 @@ def _render_staged_table(df, flag_key, editor_key):
     st.session_state[flag_key] = edited["Pilih"].fillna(False).tolist()
     return [i for i,v in enumerate(st.session_state[flag_key]) if v]
 
-def page_user_dashboard(): render_dashboard_pro(DATA, st.session_state.current_brand.capitalize(), allow_download=True)
+def page_user_dashboard(): render_dashboard_pro(load_brand_data(st.session_state.current_brand), st.session_state.current_brand.capitalize(), allow_download=True)
 
 def page_user_stock_card(): page_admin_stock_card()
 
-# ---------- IN: MULTI-ITEM (manual + excel) ----------
+# ---------- IN: MULTI-ITEM ----------
 def page_user_request_in():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Request Barang IN (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
     tab1, tab2 = st.tabs(["Tambah Manual","Tambah dari Excel"])
@@ -906,14 +858,17 @@ def page_user_request_in():
                     st.success("Ditambahkan ke daftar IN.")
         else:
             c1,c2 = st.columns(2)
-            code_new = c1.text_input("Kode Barang (opsional)")
+            code_new = c1.text_input("Kode Barang (WAJIB & unik)")
             name_new = c2.text_input("Nama Barang (wajib)")
-            unit_new = st.text_input("Satuan (mis: pcs/box/liter)", value="pcs")
+            unit_new = st.text_input("Satuan (mis: PCS/BOX/LITER)", value="PCS")
             qty=st.number_input("Jumlah", min_value=1, step=1, key="in_new_qty")
             if st.button("Tambah ke Daftar IN (Item Baru)"):
-                if not name_new.strip(): st.error("Nama wajib."); return
+                if not code_new.strip():
+                    st.error("Kode Barang wajib diisi."); st.stop()
+                if not name_new.strip():
+                    st.error("Nama Barang wajib diisi."); st.stop()
                 base={"date": datetime.now().strftime("%Y-%m-%d"),
-                      "code": (code_new.strip() if code_new.strip() else "-"),
+                      "code": code_new.strip(),
                       "item": name_new.strip(), "qty": int(qty),
                       "unit": unit_new.strip() or "-", "event":"-", "trans_type":None,
                       "do_number":"-", "attachment":None,
@@ -921,9 +876,9 @@ def page_user_request_in():
                 st.session_state.req_in_items.append(normalize_out_record(base))
                 st.success("Ditambahkan ke daftar IN.")
 
-    # Tambah dari Excel (ke staging)
+    # Tambah dari Excel (ke staging) — WAJIB Kode Barang
     with tab2:
-        st.info("Format Excel: **Tanggal | Kode Barang | Nama Barang | Qty | Unit (opsional) | Event (opsional)**")
+        st.info("Format Excel: **Tanggal | Kode Barang | Nama Barang | Qty | Unit (opsional) | Event (opsional)** — *Kode Barang wajib*")
         inv_records=[{"code":c,"name":it.get("name","-")} for c,it in DATA["inventory"].items()]
         st.download_button("📥 Unduh Template Excel IN",
                            data=make_in_template_bytes(inv_records),
@@ -937,11 +892,10 @@ def page_user_request_in():
                 st.error(f"Gagal membaca Excel: {e}"); return
             req_cols=["Tanggal","Kode Barang","Nama Barang","Qty"]
             miss=[c for c in req_cols if c not in df_new.columns]
-            if miss: st.error(f"Kolom berikut wajib: {', '.join(req_cols)}"); return
+            if miss: st.error(f"Kolom wajib belum ada: {', '.join(req_cols)}"); return
             brand=st.session_state.current_brand
             inv = load_brand_data(brand)["inventory"]
             by_code={code:(it.get("name"), it.get("unit","-")) for code,it in inv.items()}
-            by_name={it.get("name"):(code, it.get("unit","-")) for code,it in inv.items()}
             added, errors = 0, []
             for ridx,row in df_new.iterrows():
                 try:
@@ -950,20 +904,20 @@ def page_user_request_in():
                     code_x=str(row["Kode Barang"]).strip() if pd.notna(row["Kode Barang"]) else ""
                     name_x=str(row["Nama Barang"]).strip() if pd.notna(row["Nama Barang"]) else ""
                     qty_x=int(pd.to_numeric(row["Qty"], errors="coerce") or 0)
-                    unit_x=str(row["Unit (opsional)"]).strip() if "Unit (opsional)" in df_new.columns and pd.notna(row.get("Unit (opsional)")) else None
+                    unit_x=str(row["Unit (opsional)"]).strip() if "Unit (opsional)" in df_new.columns and pd.notna(row.get("Unit (opsional)")) else "-"
                     event_x=str(row["Event (opsional)"]).strip() if "Event (opsional)" in df_new.columns and pd.notna(row.get("Event (opsional)")) else "-"
-                    if not name_x: errors.append(f"Baris {ridx+2}: Nama wajib."); continue
-                    if qty_x<=0: errors.append(f"Baris {ridx+2}: Qty harus > 0."); continue
-                    inv_name, inv_unit = (None, None); inv_code=None
-                    if code_x and code_x in by_code:
-                        inv_name, inv_unit = by_code[code_x]; inv_code=code_x
-                        if not unit_x: unit_x = inv_unit
-                    elif name_x and name_x in by_name:
-                        inv_code, inv_unit = by_name[name_x]; inv_name = name_x
-                        if not unit_x: unit_x = inv_unit
-                    base={"date": date_str, "code": (inv_code if inv_code else (code_x if code_x else "-")),
-                          "item": (inv_name if inv_name else name_x), "qty": qty_x, "unit": (unit_x if unit_x else "-"),
-                          "event": (event_x if event_x else "-"), "trans_type": None,
+                    if not code_x:
+                        errors.append(f"Baris {ridx+2}: Kode Barang wajib."); continue
+                    if not name_x:
+                        errors.append(f"Baris {ridx+2}: Nama Barang wajib."); continue
+                    if qty_x<=0:
+                        errors.append(f"Baris {ridx+2}: Qty harus > 0."); continue
+                    # isi unit dari DB jika kosong & kode sudah ada
+                    if code_x in by_code and (not unit_x or unit_x=="-"):
+                        _, db_unit = by_code[code_x]; unit_x = db_unit or "-"
+                    base={"date": date_str, "code": code_x,
+                          "item": name_x, "qty": qty_x, "unit": unit_x or "-",
+                          "event": event_x or "-", "trans_type": None,
                           "do_number": "-", "attachment": None,
                           "user": st.session_state.username, "timestamp": ts_text()}
                     st.session_state.req_in_items.append(normalize_out_record(base))
@@ -1020,7 +974,6 @@ def page_user_request_in():
                     to_insert.append(r)
             if to_insert:
                 pending_add_many(st.session_state.current_brand, to_insert)
-                # Buang yang terkirim
                 keep=[i for i in range(len(st.session_state.req_in_items)) if i not in selected_idx]
                 st.session_state.req_in_items=[st.session_state.req_in_items[i] for i in keep]
                 st.session_state.in_select_flags=[False]*len(st.session_state.req_in_items)
@@ -1029,6 +982,7 @@ def page_user_request_in():
 
 # ---------- OUT: MULTI-ITEM ----------
 def page_user_request_out():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Request Barang OUT (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
     if not items: st.info("Belum ada master barang."); return
@@ -1160,6 +1114,7 @@ def page_user_request_out():
 
 # ---------- RETURN: MULTI-ITEM ----------
 def page_user_request_return():
+    DATA = load_brand_data(st.session_state.current_brand)
     st.markdown(f"## Request Retur (Multi-item) - {st.session_state.current_brand.capitalize()}"); st.divider()
     items=list(DATA["inventory"].values())
     if not items: st.info("Belum ada master barang."); return
@@ -1177,173 +1132,4 @@ def page_user_request_return():
     with tab1:
         c1,c2=st.columns(2)
         idx=c1.selectbox("Pilih Barang", range(len(items)),
-                         format_func=lambda x: f"{items[x]['name']} (Stok Gudang: {items[x]['qty']} {items[x].get('unit','-')})")
-        qty=c2.number_input("Jumlah Retur", min_value=1, step=1)
-        name=items[idx]["name"]; unit=items[idx].get("unit","-")
-        events=sorted(list(approved_out_map.get(name,set())))
-        if not events:
-            st.warning("Belum ada event OUT disetujui untuk item ini."); ev_choice=None
-        else:
-            ev_choice=st.selectbox("Pilih Event (dari OUT yang disetujui)", events)
-        if st.button("Tambah ke Daftar Retur"):
-            if not ev_choice: st.error("Pilih event terlebih dahulu."); return
-            brand=st.session_state.current_brand
-            inv=load_brand_data(brand)["inventory"]
-            code=next((c for c,it in inv.items() if it.get("name")==name), "-")
-            base={"date": datetime.now().strftime("%Y-%m-%d"), "code": code, "item": name, "qty": int(qty),
-                  "unit": unit, "event": ev_choice, "user": st.session_state.username}
-            st.session_state.req_ret_items.append(normalize_return_record(base))
-            st.success("Ditambahkan ke daftar Retur.")
-
-    with tab2:
-        st.info("Format: **Tanggal | Kode Barang | Nama Barang | Qty | Event**")
-        inv_records=[{"code":c,"name":it.get("name","-")} for c,it in DATA["inventory"].items()]
-        st.download_button("📥 Unduh Template Excel Retur",
-                           data=make_return_template_bytes(inv_records),
-                           file_name=f"Template_Retur_{st.session_state.current_brand.capitalize()}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        fu=st.file_uploader("Upload File Excel Retur", type=["xlsx"], key="ret_excel_uploader")
-        if fu and st.button("Tambah dari Excel → Daftar Retur"):
-            try:
-                df_new=pd.read_excel(fu, engine="openpyxl")
-            except Exception as e:
-                st.error(f"Gagal membaca Excel: {e}"); return
-            req=["Tanggal","Kode Barang","Nama Barang","Qty","Event"]
-            miss=[c for c in req if c not in df_new.columns]
-            if miss: st.error(f"Kolom kurang: {', '.join(miss)}"); return
-
-            brand=st.session_state.current_brand
-            inv=load_brand_data(brand)["inventory"]
-            by_code={code:(it.get("name"), it.get("unit","-")) for code,it in inv.items()}
-            by_name={it.get("name"):(code, it.get("unit","-")) for code,it in inv.items()}
-
-            # refresh approved_out_map from DB
-            approved_out_map={}
-            for h in load_brand_data(brand)["history"]:
-                if h.get("action")=="APPROVE_OUT":
-                    it=h.get("item"); ev=h.get("event")
-                    if it and ev and ev not in ["-",None,""]:
-                        approved_out_map.setdefault(it, set()).add(ev)
-
-            added, errors = 0, []
-            for ridx,row in df_new.iterrows():
-                try:
-                    dt=pd.to_datetime(row["Tanggal"], errors="coerce")
-                    date_str=dt.strftime("%Y-%m-%d") if pd.notna(dt) else datetime.now().strftime("%Y-%m-%d")
-                    code_x=str(row["Kode Barang"]).strip() if pd.notna(row["Kode Barang"]) else ""
-                    name_x=str(row["Nama Barang"]).strip() if pd.notna(row["Nama Barang"]) else ""
-                    qty_x=int(pd.to_numeric(row["Qty"], errors="coerce") or 0)
-                    event_x=str(row["Event"]).strip() if pd.notna(row["Event"]) else ""
-                    if qty_x<=0: errors.append(f"Baris {ridx+2}: Qty harus > 0."); continue
-                    if not event_x: errors.append(f"Baris {ridx+2}: Event wajib."); continue
-                    inv_name,inv_unit=(None,None); inv_code=None
-                    if code_x and code_x in by_code: inv_name,inv_unit=by_code[code_x]; inv_code=code_x
-                    elif name_x and name_x in by_name: inv_code,inv_unit=by_name[name_x]; inv_name=name_x
-                    else: errors.append(f"Baris {ridx+2}: Item tidak ditemukan."); continue
-                    valid=approved_out_map.get(inv_name,set())
-                    exists=any(e.strip().lower()==event_x.strip().lower() for e in valid)
-                    if not exists:
-                        if not valid: errors.append(f"Baris {ridx+2}: Belum ada OUT approved untuk '{inv_name}'."); continue
-                        else: errors.append(f"Baris {ridx+2}: Event '{event_x}' tidak cocok. Tersedia: {', '.join(sorted(valid))}."); continue
-                    base={"date": date_str, "code": inv_code if inv_code else "-", "item": inv_name,
-                          "qty": qty_x, "unit": inv_unit if inv_unit else "-", "event": event_x,
-                          "user": st.session_state.username}
-                    st.session_state.req_ret_items.append(normalize_return_record(base)); added+=1
-                except Exception as e:
-                    errors.append(f"Baris {ridx+2}: {e}")
-            if added: st.success(f"{added} baris ditambahkan ke daftar Retur.")
-            if errors: st.warning("Beberapa baris gagal:\n- " + "\n- ".join(errors))
-
-    # DAFTAR & SUBMIT RETUR (multi)
-    if st.session_state.req_ret_items:
-        st.divider()
-        st.subheader("Daftar Item Request Retur (Staged)")
-        df_ret=pd.DataFrame(st.session_state.req_ret_items)
-        pref_cols=[c for c in ["date","code","item","qty","unit","event"] if c in df_ret.columns]
-        df_ret=df_ret[pref_cols]
-        r1,r2=st.columns([1,1])
-        if r1.button("Pilih semua", key="ret_sel_all"): st.session_state.ret_select_flags=[True]*len(df_ret)
-        if r2.button("Kosongkan pilihan", key="ret_sel_none"): st.session_state.ret_select_flags=[False]*len(df_ret)
-        selected_idx=_render_staged_table(df_ret, "ret_select_flags", "editor_ret_staged")
-
-        if st.button("Hapus Item Terpilih", key="delete_ret"):
-            if selected_idx:
-                keep=[i for i in range(len(st.session_state.req_ret_items)) if i not in selected_idx]
-                st.session_state.req_ret_items=[st.session_state.req_ret_items[i] for i in keep]
-                st.session_state.ret_select_flags=[False]*len(st.session_state.req_ret_items)
-                st.rerun()
-            else:
-                st.info("Tidak ada baris dipilih.")
-
-        if st.button("Ajukan Request Retur Terpilih"):
-            if not selected_idx:
-                st.warning("Pilih setidaknya satu item."); return
-            to_insert=[]
-            for i,rec in enumerate(st.session_state.req_ret_items):
-                if i in selected_idx:
-                    r=rec.copy(); r["type"]="RETURN"; to_insert.append(r)
-            if to_insert:
-                pending_add_many(st.session_state.current_brand, to_insert)
-                keep=[i for i in range(len(st.session_state.req_ret_items)) if i not in selected_idx]
-                st.session_state.req_ret_items=[st.session_state.req_ret_items[i] for i in keep]
-                st.session_state.ret_select_flags=[False]*len(st.session_state.req_ret_items)
-                st.success(f"{len(to_insert)} request RETUR diajukan & menunggu approval.")
-                st.rerun()
-
-def page_user_riwayat():
-    st.markdown(f"## Riwayat Saya - {st.session_state.current_brand.capitalize()}"); st.divider()
-    hist=DATA.get("history", [])
-    rows=[]
-    for h in hist:
-        if h.get("user")!=st.session_state.username: continue
-        act=str(h.get("action","")).upper()
-        if act.startswith("APPROVE_"): status="APPROVED"; ttype=act.split("_",1)[-1]
-        elif act.startswith("REJECT_"): status="REJECTED"; ttype=act.split("_",1)[-1]
-        elif act.startswith("ADD_"): status="-"; ttype="ADD"
-        else: status="-"; ttype="-"
-        rows.append({"Status":status,"Type":ttype,"Date":h.get("date"),"Code":h.get("code","-"),
-                     "Item":h.get("item","-"),"Qty":h.get("qty","-"),"Unit":h.get("unit","-"),
-                     "Trans. Tipe":h.get("trans_type","-"),"Event":h.get("event","-"),
-                     "DO":h.get("do_number","-"),"Timestamp":h.get("timestamp","-")})
-    pend=DATA.get("pending_requests", [])
-    for p in pend:
-        if p.get("user")!=st.session_state.username: continue
-        rows.append({"Status":"PENDING","Type":p.get("type","-"),"Date":p.get("date"),"Code":p.get("code","-"),
-                    "Item":p.get("item","-"),"Qty":p.get("qty","-"),"Unit":p.get("unit","-"),
-                    "Trans. Tipe":p.get("trans_type","-"),"Event":p.get("event","-"),
-                    "DO":p.get("do_number","-"),"Timestamp":p.get("timestamp","-")})
-    if rows:
-        df=pd.DataFrame(rows)
-        try:
-            df["ts"]=pd.to_datetime(df["Timestamp"], errors="coerce")
-            df=df.sort_values("ts", ascending=False).drop(columns=["ts"])
-        except Exception: pass
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info("Anda belum memiliki riwayat transaksi.")
-
-# -------------------- ROUTING --------------------
-if role=="admin":
-    menu = st.sidebar.radio("📌 Menu Admin", [
-        "Dashboard","Lihat Stok Barang","Stock Card","Tambah Master Barang",
-        "Approve Request","Riwayat Lengkap","Export Laporan ke Excel","Reset Database","DB Health Check"
-    ])
-    if   menu=="Dashboard":                page_admin_dashboard()
-    elif menu=="Lihat Stok Barang":        page_admin_lihat_stok()
-    elif menu=="Stock Card":               page_admin_stock_card()
-    elif menu=="Tambah Master Barang":     page_admin_tambah_master()
-    elif menu=="Approve Request":          page_admin_approve()
-    elif menu=="Riwayat Lengkap":          page_admin_riwayat()
-    elif menu=="Export Laporan ke Excel":  page_admin_export()
-    elif menu=="Reset Database":           page_admin_reset()
-    elif menu=="DB Health Check":          page_admin_db_health()
-else:
-    menu = st.sidebar.radio("📌 Menu User", [
-        "Dashboard","Stock Card","Request Barang IN","Request Barang OUT","Request Retur","Lihat Riwayat"
-    ])
-    if   menu=="Dashboard":          page_user_dashboard()
-    elif menu=="Stock Card":         page_user_stock_card()
-    elif menu=="Request Barang IN":  page_user_request_in()
-    elif menu=="Request Barang OUT": page_user_request_out()
-    elif menu=="Request Retur":      page_user_request_return()
-    elif menu=="Lihat Riwayat":      page_user_riwayat()
+                         format_func=lambda x: f"{items[x]['name']} (Stok Gudang: {items

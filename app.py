@@ -35,6 +35,7 @@ STD_REQ_COLS = ["date","code","item","qty","unit","event","trans_type","do_numbe
 
 st.set_page_config(page_title="Inventory System", page_icon=ICON_URL, layout="wide")
 
+# alias st.experimental_rerun → st.rerun jika perlu
 try:
     if not hasattr(st, "experimental_rerun"):
         st.experimental_rerun = st.rerun
@@ -196,9 +197,34 @@ def _safe_select(table: str) -> pd.DataFrame:
         st.warning(f"Tabel '{table}' tidak bisa dibaca: {e}")
         return pd.DataFrame([])
 
+def _alias_inventory_frame(df_inv_raw: pd.DataFrame) -> pd.DataFrame:
+    """Kompatibilitas: balance→qty, name→item."""
+    df = df_inv_raw.copy()
+    if df.empty:
+        for c in ["code","item","qty","unit","category"]:
+            if c not in df.columns:
+                df[c] = None
+        return df[["code","item","qty","unit","category"]]
+
+    # name → item
+    if "item" not in df.columns and "name" in df.columns:
+        df = df.rename(columns={"name": "item"})
+    # balance → qty
+    if "qty" not in df.columns and "balance" in df.columns:
+        df = df.rename(columns={"balance": "qty"})
+
+    for c in ["code","item","qty","unit","category"]:
+        if c not in df.columns:
+            df[c] = None
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
+    df["item"] = df["item"].astype(str).fillna("-")
+    return df[["code","item","qty","unit","category"]]
+
 def load_brand_data(brand: str) -> dict:
     t = TABLES[brand]
-    df_inv  = _safe_select(t["inv"])
+    df_inv_raw  = _safe_select(t["inv"])
+    df_inv = _alias_inventory_frame(df_inv_raw)
+
     df_pend = _safe_select(t["pend"])
     df_hist = _safe_select(t["hist"])
 
@@ -228,13 +254,28 @@ def invalidate_cache(): st.cache_data.clear()
 
 # -------------------- WRITES --------------------
 def inv_insert_raw(brand, payload: dict):
+    """Insert kompatibel: tulis (item & name) + (qty & balance) bila ada."""
     t = TABLES[brand]
-    supabase.from_(t["inv"]).insert(payload).execute()
+    p = payload.copy()
+    # gandakan kolom kompat
+    if "item" in p and "name" not in p: p["name"] = p["item"]
+    if "name" in p and "item" not in p: p["item"] = p["name"]
+    if "qty" in p and "balance" not in p: p["balance"] = p["qty"]
+    if "balance" in p and "qty" not in p: p["qty"] = p["balance"]
+    supabase.from_(t["inv"]).insert(p).execute()
     invalidate_cache()
 
-def inv_update_qty(brand, code, new_qty):
+def inv_update_qty(brand, code, new_qty: int):
+    """Update qty; fallback ke 'balance' jika kolom 'qty' tidak ada."""
     t = TABLES[brand]
-    supabase.from_(t["inv"]).update({"qty": int(new_qty)}).eq("code", code).execute()
+    try:
+        supabase.from_(t["inv"]).update({"qty": int(new_qty), "balance": int(new_qty)}).eq("code", code).execute()
+    except Exception:
+        # fallback 1 kolom
+        try:
+            supabase.from_(t["inv"]).update({"qty": int(new_qty)}).eq("code", code).execute()
+        except Exception:
+            supabase.from_(t["inv"]).update({"balance": int(new_qty)}).eq("code", code).execute()
     invalidate_cache()
 
 def pending_add_many(brand, records: list):
@@ -244,10 +285,17 @@ def pending_add_many(brand, records: list):
     invalidate_cache()
 
 def pending_delete_by_ids(brand, ids: list):
+    """Hapus by id; fallback by timestamp kalau id None."""
     t = TABLES[brand]
-    if not ids: return
-    for chunk in [ids[i:i+1000] for i in range(0, len(ids), 1000)]:
-        supabase.from_(t["pend"]).delete().in_("id", chunk).execute()
+    if ids:
+        for chunk in [ids[i:i+1000] for i in range(0, len(ids), 1000)]:
+            supabase.from_(t["pend"]).delete().in_("id", chunk).execute()
+    invalidate_cache()
+
+def pending_delete_by_timestamps(brand, timestamps: list):
+    t = TABLES[brand]
+    for ts in timestamps:
+        supabase.from_(t["pend"]).delete().eq("timestamp", ts).execute()
     invalidate_cache()
 
 def history_add(brand, rec: dict):
@@ -470,6 +518,12 @@ brand_choice = st.sidebar.selectbox("Pilih Brand", BRANDS, format_func=lambda x:
 st.session_state.current_brand = brand_choice
 DATA = load_brand_data(brand_choice)
 
+def _do_refresh():
+    invalidate_cache()
+    st.rerun()
+
+st.sidebar.button("🔄 Refresh data", on_click=_do_refresh)
+
 if st.sidebar.button("🚪 Logout"):
     st.session_state.logged_in=False
     st.session_state.username=""
@@ -526,7 +580,7 @@ def page_admin_stock_card():
             t_in=qty; saldo+=qty; ket="Initial Stock"
         elif act=="APPROVE_IN":
             t_in=qty; saldo+=qty
-            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and do!='- ' else "")
+            do=h.get("do_number","-"); ket=f"Request IN by {h.get('user','-')}" + (f" (DO: {do})" if do and str(do).strip()!='-' else "")
         elif act=="APPROVE_OUT":
             t_out=qty; saldo-=qty
             ket=f"Request OUT ({h.get('trans_type','-')}) by {h.get('user','-')} — Event: {h.get('event','-')}"
@@ -623,6 +677,7 @@ def page_admin_approve():
         t=TABLES[brand]
         inv_map = load_brand_data(brand)["inventory"]  # fresh
         approved_ids=[]
+        fallback_ts=[]
         for i in selected_idx:
             req=pend[i]
             qty=int(pd.to_numeric(req["qty"], errors="coerce") or 0)
@@ -664,11 +719,18 @@ def page_admin_approve():
                                 "event":req.get("event","-"),"do_number":req.get("do_number","-"),
                                 "attachment":req.get("attachment"),"timestamp":ts_text(),"date":req.get("date"),
                                 "code":found_code,"trans_type":req.get("trans_type")})
-            approved_ids.append(req.get("id"))
+            if req.get("id") is not None:
+                approved_ids.append(req.get("id"))
+            else:
+                fallback_ts.append(req.get("timestamp"))
 
         if approved_ids:
             pending_delete_by_ids(brand, approved_ids)
-            st.session_state.notification={"type":"success","message":f"{len(approved_ids)} request di-approve."}
+        if fallback_ts:
+            pending_delete_by_timestamps(brand, fallback_ts)
+
+        if approved_ids or fallback_ts:
+            st.session_state.notification={"type":"success","message":"Request terpilih di-approve."}
         else:
             st.session_state.notification={"type":"warning","message":"Tidak ada request valid yang diproses."}
         st.rerun()
@@ -677,7 +739,7 @@ def page_admin_approve():
         if not selected_idx:
             st.session_state.notification={"type":"warning","message":"Pilih setidaknya satu item."}; st.rerun()
         brand=st.session_state.current_brand
-        rejected_ids=[]
+        rejected_ids=[]; fallback_ts=[]
         for i in selected_idx:
             req=pend[i]
             history_add(brand, {"action":f"REJECT_{str(req.get('type','-')).upper()}","item":req.get("item","-"),
@@ -686,10 +748,16 @@ def page_admin_approve():
                                 "event":req.get("event","-"),"do_number":req.get("do_number","-"),
                                 "attachment":req.get("attachment"),"timestamp":ts_text(),
                                 "date":req.get("date"),"code":req.get("code"),"trans_type":req.get("trans_type")})
-            rejected_ids.append(req.get("id"))
+            if req.get("id") is not None:
+                rejected_ids.append(req.get("id"))
+            else:
+                fallback_ts.append(req.get("timestamp"))
         if rejected_ids:
             pending_delete_by_ids(brand, rejected_ids)
-            st.session_state.notification={"type":"success","message":f"{len(rejected_ids)} request di-reject."}
+        if fallback_ts:
+            pending_delete_by_timestamps(brand, fallback_ts)
+
+        st.session_state.notification={"type":"success","message":"Request terpilih di-reject."}
         st.rerun()
 
 def page_admin_riwayat():
@@ -763,6 +831,18 @@ def page_admin_reset():
         reset_brand(st.session_state.current_brand)
         st.session_state.notification={"type":"success","message":"✅ Database direset!"}
         st.rerun()
+
+def page_admin_db_health():
+    st.markdown(f"## DB Health Check — {st.session_state.current_brand.capitalize()}"); st.divider()
+    st.write("Supabase URL:", SUPABASE_URL)
+    t = TABLES[st.session_state.current_brand]
+    for label, tbl in [("Inventory", t["inv"]), ("Pending", t["pend"]), ("History", t["hist"])]:
+        try:
+            res = supabase.from_(tbl).select("*").execute()
+            cnt = len(res.data or [])
+            st.success(f"{label} ({tbl}) → {cnt} rows")
+        except Exception as e:
+            st.error(f"Gagal baca {tbl}: {e}")
 
 # -------------------- USER PAGES --------------------
 def _existing_events_for_out(brand: str) -> list:
@@ -1246,7 +1326,7 @@ def page_user_riwayat():
 if role=="admin":
     menu = st.sidebar.radio("📌 Menu Admin", [
         "Dashboard","Lihat Stok Barang","Stock Card","Tambah Master Barang",
-        "Approve Request","Riwayat Lengkap","Export Laporan ke Excel","Reset Database"
+        "Approve Request","Riwayat Lengkap","Export Laporan ke Excel","Reset Database","DB Health Check"
     ])
     if   menu=="Dashboard":                page_admin_dashboard()
     elif menu=="Lihat Stok Barang":        page_admin_lihat_stok()
@@ -1256,6 +1336,7 @@ if role=="admin":
     elif menu=="Riwayat Lengkap":          page_admin_riwayat()
     elif menu=="Export Laporan ke Excel":  page_admin_export()
     elif menu=="Reset Database":           page_admin_reset()
+    elif menu=="DB Health Check":          page_admin_db_health()
 else:
     menu = st.sidebar.radio("📌 Menu User", [
         "Dashboard","Stock Card","Request Barang IN","Request Barang OUT","Request Retur","Lihat Riwayat"

@@ -1248,7 +1248,7 @@ def page_user_riwayat():
 # -------------------- SIDEBAR (Accordion collapsed) --------------------
 with st.sidebar:
     st.markdown(f"### 👋 Halo, {st.session_state.username}")
-    st.caption(f"Role: **{st.session_state.role.upper()}**")
+  
 
     if st.button("🔄 Refresh data", use_container_width=True):
         invalidate_cache()
